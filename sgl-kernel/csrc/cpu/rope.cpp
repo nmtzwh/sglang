@@ -86,8 +86,8 @@ void rotary_embedding_neox_4D_kernel_impl(
     int64_t head_size,
     int64_t batch_size,
     int64_t seq_len) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int64_t bVecSize = bVec::size();
 
   int64_t embed_dim = rotary_dim / 2;
@@ -110,13 +110,13 @@ void rotary_embedding_neox_4D_kernel_impl(
       bVec _q_x = bVec::loadu(qk + out_x);
       bVec _q_y = bVec::loadu(qk + out_y);
       fVec _cos_0, _cos_1;
-      std::tie(_cos_0, _cos_1) = at::vec::convert_to_float(_cos);
+      std::tie(_cos_0, _cos_1) = sgl_vec::convert_to_float(_cos);
       fVec _sin_0, _sin_1;
-      std::tie(_sin_0, _sin_1) = at::vec::convert_to_float(_sin);
+      std::tie(_sin_0, _sin_1) = sgl_vec::convert_to_float(_sin);
       fVec _q_x_0, _q_x_1;
-      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
+      std::tie(_q_x_0, _q_x_1) = sgl_vec::convert_to_float(_q_x);
       fVec _q_y_0, _q_y_1;
-      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
+      std::tie(_q_y_0, _q_y_1) = sgl_vec::convert_to_float(_q_y);
 
       auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
       auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;

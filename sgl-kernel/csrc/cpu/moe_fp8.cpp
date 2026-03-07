@@ -6,7 +6,7 @@ namespace {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
@@ -17,8 +17,8 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
   int64_t d;
@@ -26,7 +26,7 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     bVec x = bVec::loadu(input + d);
     fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x);
     x0 = x0 * weight_vec;
     x1 = x1 * weight_vec;
     bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
@@ -40,8 +40,8 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
 // acc from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   if (topk == 1) {
     // do copy for topk = 1
@@ -56,7 +56,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
       for (int t = 0; t < topk; ++t) {
         bVec x_bvec = bVec::loadu(input + t * K + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec0 += x_fvec0;
         sum_fvec1 += x_fvec1;
@@ -82,8 +82,8 @@ inline void add_mul_stub(
     const scalar_t* __restrict__ input2,
     float scale,
     int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_vec = fVec(scale);
 
@@ -92,11 +92,11 @@ inline void add_mul_stub(
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     bVec x_bvec = bVec::loadu(input + d);
     fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x_bvec);
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x_bvec);
 
     bVec y_bvec = bVec::loadu(input2 + d);
     fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
+    std::tie(y0, y1) = sgl_vec::convert_to_float(y_bvec);
 
     x0 = x0 + y0 * s_vec;
     x1 = x1 + y1 * s_vec;
@@ -111,8 +111,8 @@ inline void add_mul_stub(
 template <typename scalar_t>
 inline void silu_and_mul_stub(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   const fVec one = fVec(1.f);
 
   // no remainder
@@ -120,10 +120,10 @@ inline void silu_and_mul_stub(
   for (int64_t d = 0; d < size; d += bVec::size()) {
     bVec x = bVec::loadu(input + d);
     fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x);
     bVec y = bVec::loadu(input2 + d);
     fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y);
+    std::tie(y0, y1) = sgl_vec::convert_to_float(y);
     x0 = x0 / (one + x0.neg().exp_u20());
     x1 = x1 / (one + x1.neg().exp_u20());
     x0 = x0 * y0;

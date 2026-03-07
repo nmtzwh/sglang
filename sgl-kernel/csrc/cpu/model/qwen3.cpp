@@ -4,7 +4,7 @@ namespace {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
   constexpr int kVecSize = bVec::size();
   int64_t d = 0;
 #pragma GCC unroll 4

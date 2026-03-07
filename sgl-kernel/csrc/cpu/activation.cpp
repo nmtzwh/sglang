@@ -11,8 +11,8 @@ void act_and_mul_kernel_impl(
     int64_t dim,
     const func_t& f,
     const vec_func_t& vf) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int64_t kVecSize = bVec::size();
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
@@ -27,11 +27,11 @@ void act_and_mul_kernel_impl(
       for (d = 0; d <= dim - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         bVec y_bvec = bVec::loadu(input_other_ptr + d);
         fVec y_fvec0, y_fvec1;
-        std::tie(y_fvec0, y_fvec1) = at::vec::convert_to_float(y_bvec);
+        std::tie(y_fvec0, y_fvec1) = sgl_vec::convert_to_float(y_bvec);
 
         x_fvec0 = vf(x_fvec0);
         x_fvec1 = vf(x_fvec1);
@@ -66,7 +66,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
   at::Tensor out = at::empty(sizes, input.options());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     act_and_mul_kernel_impl(
         out.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
@@ -89,7 +89,7 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
   const float sqrt_2_div_pi = std::sqrt(2.f / M_PI);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     act_and_mul_kernel_impl(
         out.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
@@ -120,7 +120,7 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
   at::Tensor out = at::empty(sizes, input.options());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_and_mul", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
     act_and_mul_kernel_impl(
         out.data_ptr<scalar_t>(),

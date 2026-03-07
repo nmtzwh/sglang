@@ -191,6 +191,80 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 };
 #endif
 
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic INT8 GEMM micro-kernel using svdot_s32
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const uint8_t* __restrict__ A,
+      const int8_t* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs,
+      const int32_t* __restrict__ Bcomp,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
+    constexpr int ROWS = BLOCK_M;
+    const uint64_t vl_s32 = svcntw();
+
+    // Accumulate in int32
+    int32_t acc[ROWS][BLOCK_N];
+    for (int m = 0; m < ROWS; ++m) {
+      for (int n = 0; n < BLOCK_N; ++n) {
+        acc[m][n] = 0;
+      }
+    }
+
+    // K is in bytes, each dot-product processes 4 bytes
+    const int64_t K4 = K >> 2;
+    const int32_t* a_ptr = reinterpret_cast<const int32_t*>(A);
+    const int64_t lda4 = lda >> 2;
+    const int32_t* b_ptr = reinterpret_cast<const int32_t*>(B);
+    const int64_t ldb4 = ldb;
+
+    for (int64_t k = 0; k < K4; ++k) {
+      for (int m = 0; m < ROWS; ++m) {
+        int32_t a_val = a_ptr[m * lda4 + k];
+        // Broadcast A as uint8x4 packed in int32
+        svuint8_t va = svreinterpret_u8(svdup_s32(a_val));
+
+        const int32_t* b_row = b_ptr + k * ldb4;
+        for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
+          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+          svint32_t vc = svld1_s32(pg, acc[m] + n);
+          svint8_t vb = svreinterpret_s8(svld1_s32(pg, b_row + n));
+          vc = svdot_s32(vc, svreinterpret_s8(va), vb);
+          svst1_s32(pg, acc[m] + n, vc);
+        }
+      }
+    }
+
+    // Dequantize: (acc - Bcomp) * As * Bs + bias
+    for (int m = 0; m < ROWS; ++m) {
+      float as_val = As[m];
+      for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+        svint32_t vc = svld1_s32(pg, acc[m] + n);
+        svint32_t vcomp = svld1_s32(pg, Bcomp + n);
+        svfloat32_t vf = svcvt_f32_s32_x(pg, svsub_s32_x(pg, vc, vcomp));
+        svfloat32_t vbs = svld1_f32(pg, Bs + n);
+        vf = svmul_f32_x(pg, svmul_f32_x(pg, vf, svdup_f32(as_val)), vbs);
+        if (has_bias) {
+          svfloat32_t vbias = svld1_f32(pg, bias + n);
+          vf = svadd_f32_x(pg, vf, vbias);
+        }
+        // Convert to bf16 and store
+        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vf);
+        svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
+      }
+    }
+  }
+};
+#endif
+
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                \
   tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
       A + mb_start * lda,                                          \

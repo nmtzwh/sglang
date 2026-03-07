@@ -134,7 +134,7 @@ void extend_attention_kernel_impl(
             /* ld_dst */ BLOCK_N);
 
         // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M     */ m_size,
             /* N     */ n_size,
             /* K     */ head_size,
@@ -160,7 +160,7 @@ void extend_attention_kernel_impl(
             /* ld_dst */ head_size_v);
 
         // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M     */ m_size,
             /* N     */ head_size_v,
             /* K     */ padded_n_size,  // n_size
@@ -191,7 +191,7 @@ void extend_attention_kernel_impl(
             /* ld_dst */ BLOCK_N);
 
         // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M     */ m_size,
             /* N     */ n_size,
             /* K     */ head_size,
@@ -226,7 +226,7 @@ void extend_attention_kernel_impl(
             /* ld_dst */ head_size_v);
 
         // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M     */ m_size,
             /* N     */ head_size_v,
             /* K     */ padded_n_size,  // n_size
@@ -248,7 +248,7 @@ void extend_attention_kernel_impl(
       // move to the next index
       data_index_step(bs, batches, head_id, num_heads, mb, MB);
     }
-    at::native::cpublas::brgemm_release();
+    brgemm_release_portable();
   });
 }
 

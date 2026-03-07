@@ -5,7 +5,7 @@
 
 namespace {
 
-using namespace at::vec;
+using namespace sgl_vec;
 
 template <typename index_t>
 inline index_t get_index(index_t* ind, int i) {

@@ -14,7 +14,7 @@ namespace {
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
   constexpr int kVecSize = Vec::size();
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
   int d = 0;
@@ -70,8 +70,8 @@ void chunk_gated_delta_rule_kernel_impl(
   int64_t final_state_StrideE = v_head_size;
   int64_t head_group = v_num_head / qk_num_head;
   float scale = 1.0 / std::sqrt(qk_head_size);
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int64_t VecSize = bVec::size();
   constexpr int64_t fVecSize = fVec::size();
 
@@ -107,12 +107,12 @@ void chunk_gated_delta_rule_kernel_impl(
         for (d = 0; d <= qk_head_size - VecSize; d += VecSize) {
           bVec q_bvec = bVec::loadu(q_orig + q_offset + d);
           fVec q_fvec0, q_fvec1;
-          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+          std::tie(q_fvec0, q_fvec1) = sgl_vec::convert_to_float(q_bvec);
           sum_q_fvec += q_fvec0 * q_fvec0;
           sum_q_fvec += q_fvec1 * q_fvec1;
           bVec k_bvec = bVec::loadu(k_orig + k_offset + d);
           fVec k_fvec0, k_fvec1;
-          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+          std::tie(k_fvec0, k_fvec1) = sgl_vec::convert_to_float(k_bvec);
           sum_k_fvec += k_fvec0 * k_fvec0;
           sum_k_fvec += k_fvec1 * k_fvec1;
         }
@@ -243,9 +243,9 @@ void chunk_gated_delta_rule_kernel_impl(
     THREAD_BUFFER_ALLOC(v_pack, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(k_beta_g, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
     THREAD_BUFFER_ALLOC(k_beta_g_pack, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
-    THREAD_BUFFER_ALLOC(curr_attn, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
+    THREAD_BUFFER_ALLOC(curr_attn, thread_buff_ptr, offset, float, chunk_size * chunk_size * 2);
     THREAD_BUFFER_ALLOC(curr_attn_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
-    THREAD_BUFFER_ALLOC(k_cumdecay, thread_buff_ptr, offset, float, chunk_size* qk_head_size * 2);
+    THREAD_BUFFER_ALLOC(k_cumdecay, thread_buff_ptr, offset, float, chunk_size * qk_head_size * 2);
     THREAD_BUFFER_ALLOC(row, thread_buff_ptr, offset, float, chunk_size * 2);
     THREAD_BUFFER_ALLOC(updated, thread_buff_ptr, offset, float, chunk_size * 2);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
@@ -304,7 +304,7 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_src */ qk_head_size,
           /* ld_dst */ chunk_size);
       // k_beta @ key.transpose(-1, -2)
-      at::native::cpublas::brgemm(
+      gemm_kernel_portable(
           /*     M */ chunk_size,
           /*     N */ chunk_size,
           /*     K */ qk_head_size,
@@ -317,7 +317,7 @@ void chunk_gated_delta_rule_kernel_impl(
           /*     C */ curr_attn);
       // attn = attn * decay_mask
       for (int64_t m = 0; m < chunk_size; m++) {
-        at::vec::map2<float>(
+        sgl_vec::map2<float>(
             [](fVec x, fVec y) { return fVec(0) - x * y; },
             curr_attn + m * chunk_size,
             curr_attn + m * chunk_size,
@@ -398,7 +398,7 @@ void chunk_gated_delta_rule_kernel_impl(
       }
       for (int i = 0; i < chunk_size; i++) {
         curr_attn[i * chunk_size + i] += 1.0f;
-        at::vec::map<scalar_t>(
+        sgl_vec::map<scalar_t>(
             [](fVec x) { return x; }, curr_attn_reduced + i * chunk_size, curr_attn + i * chunk_size, chunk_size);
       }
 
@@ -416,7 +416,7 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_src */ v_head_size,
           /* ld_dst */ v_head_size);
       // value = attn @ v_beta
-      at::native::cpublas::brgemm(
+      gemm_kernel_portable(
           /*     M */ chunk_size,
           /*     N */ v_head_size,
           /*     K */ chunk_size,
@@ -448,7 +448,7 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_src */ qk_head_size,
           /* ld_dst */ qk_head_size);
       // k_cumdecay = attn @ k_beta_g
-      at::native::cpublas::brgemm(
+      gemm_kernel_portable(
           /*     M */ chunk_size,
           /*     N */ qk_head_size,
           /*     K */ chunk_size,
@@ -460,7 +460,7 @@ void chunk_gated_delta_rule_kernel_impl(
           /*     B */ k_beta_g_pack,
           /*     C */ k_cumdecay);
       for (int i = 0; i < chunk_size; i++) {
-        at::vec::map<scalar_t>(
+        sgl_vec::map<scalar_t>(
             [](fVec x) { return x; },
             curr_k_cumdecay_reduced + i * qk_head_size,
             k_cumdecay + i * qk_head_size,
@@ -493,16 +493,16 @@ void chunk_gated_delta_rule_kernel_impl(
     THREAD_BUFFER_ALLOC(
         curr_last_recurrent_state_pack_reduced, thread_buff_ptr, offset, scalar_t, qk_head_size * v_head_size);
     THREAD_BUFFER_ALLOC(k_transpose_i, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
-    THREAD_BUFFER_ALLOC(attn_i, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
+    THREAD_BUFFER_ALLOC(attn_i, thread_buff_ptr, offset, float, chunk_size * chunk_size * 2);
     THREAD_BUFFER_ALLOC(attn_i_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
-    THREAD_BUFFER_ALLOC(v_prime, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
+    THREAD_BUFFER_ALLOC(v_prime, thread_buff_ptr, offset, float, chunk_size * v_head_size * 2);
     THREAD_BUFFER_ALLOC(v_prime_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(v_prime_pack_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(qg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
-    THREAD_BUFFER_ALLOC(attn_inter, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
+    THREAD_BUFFER_ALLOC(attn_inter, thread_buff_ptr, offset, float, chunk_size * v_head_size * 2);
     THREAD_BUFFER_ALLOC(kg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
     THREAD_BUFFER_ALLOC(kg_transpose, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
-    THREAD_BUFFER_ALLOC(kgv, thread_buff_ptr, offset, float, qk_head_size* v_head_size * 2);
+    THREAD_BUFFER_ALLOC(kgv, thread_buff_ptr, offset, float, qk_head_size * v_head_size * 2);
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t start_q = cu_seqlens_ptr[b];
@@ -529,7 +529,7 @@ void chunk_gated_delta_rule_kernel_impl(
                                 h * global_total_seq_length * v_head_size;  // [num_chunk, chunk_size, EV]
       for (int64_t c = 0; c < num_chunk; c++) {
         for (int i = 0; i < qk_head_size; i++) {
-          at::vec::map<scalar_t>(
+          sgl_vec::map<scalar_t>(
               [](fVec x) { return x; },
               curr_last_recurrent_state_reduced + i * v_head_size,
               curr_last_recurrent_state + i * v_head_size,
@@ -554,7 +554,7 @@ void chunk_gated_delta_rule_kernel_impl(
             /* ld_src */ qk_head_size,
             /* ld_dst */ chunk_size);
         // attn_i = q_i @ k_transpose_i
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M */ chunk_size,
             /* N */ chunk_size,
             /* K */ qk_head_size,
@@ -575,14 +575,14 @@ void chunk_gated_delta_rule_kernel_impl(
             auto tmp0 = fVec::loadu(attn_i_m + n);
             auto tmp1 = fVec::loadu(decay_mask_i_m + n);
             auto tmp2 = tmp0 * tmp1;
-            auto tmp3 = at::vec::convert<scalar_t>(tmp2);
+            auto tmp3 = sgl_vec::convert<scalar_t>(tmp2);
             tmp3.store(attn_i_reduced_m + n, fVecSize);
           }
           if (n < chunk_size) {
             auto tmp0 = fVec::loadu(attn_i_m + n, chunk_size - n);
             auto tmp1 = fVec::loadu(decay_mask_i_m + n, chunk_size - n);
             auto tmp2 = tmp0 * tmp1;
-            auto tmp3 = at::vec::convert<scalar_t>(tmp2);
+            auto tmp3 = sgl_vec::convert<scalar_t>(tmp2);
             tmp3.store(attn_i_reduced_m + n, chunk_size - n);
           }
         }
@@ -615,7 +615,7 @@ void chunk_gated_delta_rule_kernel_impl(
         // v_prime = k_cumdecay_i @ curr_last_recurrent_state: [chunk_size, EV]
         // k_cumdecay_i: [chunk_size, EK]
         // curr_last_recurrent_state: [EK, EV]
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /*     M */ chunk_size,
             /*     N */ v_head_size,
             /*     K */ qk_head_size,
@@ -635,7 +635,7 @@ void chunk_gated_delta_rule_kernel_impl(
             auto tmp0 = fVec::loadu(v_i + m * v_head_size + i);
             auto tmp1 = fVec::loadu(v_prime + m * v_head_size + i);
             auto tmp2 = tmp0 - tmp1;
-            auto tmp3 = at::vec::convert<scalar_t>(tmp2);
+            auto tmp3 = sgl_vec::convert<scalar_t>(tmp2);
             tmp3.store(v_prime_reduced + m * v_head_size + i, fVecSize);
           }
         }
@@ -658,7 +658,7 @@ void chunk_gated_delta_rule_kernel_impl(
         }
         // attn_inter = qg @ curr_last_recurrent_state: [chunk_size, EV]
         // curr_last_recurrent_state: [EK, EV]
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M */ chunk_size,
             /* N */ v_head_size,
             /* K */ qk_head_size,
@@ -682,7 +682,7 @@ void chunk_gated_delta_rule_kernel_impl(
         // attn_inter = attn_inter + attn_i @ v_new: [chunk_size, EV]
         // attn_i: [chunk_size, chunk_size]
         // v_new: [chunk_size, EV]
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M */ chunk_size,
             /* N */ v_head_size,
             /* K */ chunk_size,
@@ -696,7 +696,7 @@ void chunk_gated_delta_rule_kernel_impl(
 
         // core_attn_out[:, :, i] = attn_inter
         for (int64_t m = 0; m < chunk_size; m++) {
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [](fVec x) { return x; }, core_attn_out_i + m * v_head_size, attn_inter + m * v_head_size, v_head_size);
         }
 
@@ -715,13 +715,13 @@ void chunk_gated_delta_rule_kernel_impl(
           auto vec_g_exp_last = fVec(g_exp_last);
           for (; i < fVecSize * (v_head_size / fVecSize); i += fVecSize) {
             auto tmp0 = bVec::loadu(curr_last_recurrent_state_reduced + m * v_head_size + i);
-            auto tmp1 = at::vec::convert<float>(tmp0);
+            auto tmp1 = sgl_vec::convert<float>(tmp0);
             auto tmp2 = tmp1 * vec_g_exp_last;
             tmp2.store(curr_last_recurrent_state + m * v_head_size + i);
           }
           if (i < v_head_size) {
             auto tmp0 = bVec::loadu(curr_last_recurrent_state_reduced + m * v_head_size + i, v_head_size - i);
-            auto tmp1 = at::vec::convert<float>(tmp0);
+            auto tmp1 = sgl_vec::convert<float>(tmp0);
             auto tmp2 = tmp1 * vec_g_exp_last;
             tmp2.store(curr_last_recurrent_state + m * v_head_size + i, v_head_size - i);
           }
@@ -757,7 +757,7 @@ void chunk_gated_delta_rule_kernel_impl(
             /* ld_dst */ chunk_size);
         // kgv = kg.transpose(-1, -2) @ v_new
         // v_new: [chunk_size, EV]
-        at::native::cpublas::brgemm(
+        gemm_kernel_portable(
             /* M */ qk_head_size,
             /* N */ v_head_size,
             /* K */ chunk_size,
@@ -770,7 +770,7 @@ void chunk_gated_delta_rule_kernel_impl(
             /* C */ kgv);
         // last_recurrent_state = 1) + 2)
         for (int64_t m = 0; m < qk_head_size; m++) {
-          at::vec::map2<float>(
+          sgl_vec::map2<float>(
               [](fVec x, fVec y) { return x + y; },
               curr_last_recurrent_state + m * v_head_size,
               curr_last_recurrent_state + m * v_head_size,
@@ -784,7 +784,7 @@ void chunk_gated_delta_rule_kernel_impl(
       // core_attn_out: [B, HV, padded_T, EV]
       auto curr_out = out_ptr + h * oStrideH;
       for (int64_t m = 0; m < seq_len; m++) {
-        at::vec::map<scalar_t>(
+        sgl_vec::map<scalar_t>(
             [](fVec x) { return x; }, curr_out + m * oStrideT, curr_core_attn_out + m * v_head_size, v_head_size);
       }
 
@@ -803,8 +803,8 @@ inline float softplus(float x, double threshold = 20.0) {
     return std::log1p(std::exp(x));
 }
 
-inline at::vec::Vectorized<float> softplus(const at::vec::Vectorized<float>& x, double threshold = 20.0) {
-  using Vec = at::vec::Vectorized<float>;
+inline sgl_vec::Vectorized<float> softplus(const sgl_vec::Vectorized<float>& x, double threshold = 20.0) {
+  using Vec = sgl_vec::Vectorized<float>;
   Vec mask_hi = x > Vec(threshold);
   Vec mask_lo = x < Vec(-threshold);
 
@@ -844,8 +844,8 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     int64_t v_strideH,
     bool use_qk_l2norm_in_kernel,
     double softplus_threshold) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int64_t VecSize = bVec::size();
   constexpr int64_t fVecSize = fVec::size();
@@ -871,12 +871,12 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         for (d = 0; d <= head_dim - VecSize; d += VecSize) {
           bVec q_bvec = bVec::loadu(q_ptr + q_offset + d);
           fVec q_fvec0, q_fvec1;
-          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+          std::tie(q_fvec0, q_fvec1) = sgl_vec::convert_to_float(q_bvec);
           sum_q_fvec += q_fvec0 * q_fvec0;
           sum_q_fvec += q_fvec1 * q_fvec1;
           bVec k_bvec = bVec::loadu(k_ptr + k_offset + d);
           fVec k_fvec0, k_fvec1;
-          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+          std::tie(k_fvec0, k_fvec1) = sgl_vec::convert_to_float(k_bvec);
           sum_k_fvec += k_fvec0 * k_fvec0;
           sum_k_fvec += k_fvec1 * k_fvec1;
         }
@@ -930,7 +930,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         }
         bVec v_bvec = bVec::loadu(v_ptr + v_offset + dvi);
         fVec v_vec0, v_vec1;
-        std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
+        std::tie(v_vec0, v_vec1) = sgl_vec::convert_to_float(v_bvec);
         fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
         fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
         fVec o_vec0 = fVec(float(0));
@@ -947,7 +947,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
           state_vec0.store(state_ptr + state_offset + di * v_head_dim + dvi);
           state_vec1.store(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
         }
-        bVec o_vec = at::vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
+        bVec o_vec = sgl_vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
         o_vec.store(o_ptr + o_offset + dvi);
       }
       for (; dvi < v_head_dim; ++dvi) {
@@ -983,8 +983,8 @@ void fused_gdn_gating_kernel_impl(
     scalar_t* __restrict__ beta,
     int64_t batch,
     int64_t num_heads) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
@@ -999,9 +999,9 @@ void fused_gdn_gating_kernel_impl(
         bVec a_bvec = bVec::loadu(a + i * num_heads + j);
         bVec b_bvec = bVec::loadu(b + i * num_heads + j);
         fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
-        std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
-        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
-        std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
+        std::tie(a0, a1) = sgl_vec::convert_to_float(a_bvec);
+        std::tie(b0, b1) = sgl_vec::convert_to_float(b_bvec);
+        std::tie(dt_bias_vec0, dt_bias_vec1) = sgl_vec::convert_to_float(dt_bias_vec);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
@@ -1010,7 +1010,7 @@ void fused_gdn_gating_kernel_impl(
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);
-        bVec beta_vec = at::vec::convert_from_float<scalar_t>(beta0, beta1);
+        bVec beta_vec = sgl_vec::convert_from_float<scalar_t>(beta0, beta1);
         beta_vec.store(beta + i * num_heads + j);
       }
       for (; j < num_heads; ++j) {

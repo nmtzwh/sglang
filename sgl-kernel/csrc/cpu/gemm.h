@@ -3,7 +3,7 @@
 
 #include "common.h"
 
-// amx-bf16
+// amx-bf16 (x86 only)
 #define TILE_M 16
 #define TILE_N 16
 #define TILE_K 32
@@ -17,8 +17,31 @@ constexpr int block_size_n() {
 }
 
 // define threshold using brgemm (intel AMX)
+// On aarch64, brgemm is not available (AMX is x86-only),
+// so always fall back to tinygemm intrinsic kernels.
 template <typename T>
 inline bool can_use_brgemm(int M);
+
+#if defined(__aarch64__) || defined(__arm64__)
+// aarch64: always disable brgemm
+template <>
+inline bool can_use_brgemm<at::BFloat16>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<at::Half>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<int8_t>(int M) {
+  return false;
+}
+template <>
+inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
+  return false;
+}
+#else
+// x86: use brgemm for larger M
 template <>
 inline bool can_use_brgemm<at::BFloat16>(int M) {
   return M > 4;
@@ -32,11 +55,11 @@ template <>
 inline bool can_use_brgemm<int8_t>(int M) {
   return M > 4;
 }
-
 template <>
 inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
+#endif
 
 // work around compiler internal error
 #define BLOCK_K 128  // 4 * TILE_K
@@ -269,3 +292,163 @@ void tinygemm_kernel(
     int64_t ldc_s,
     bool store_out,
     bool use_brgemm);
+
+// ============================================================================
+// Portable GEMM wrapper
+//
+// Dispatches to brgemm (x86 AMX) or SVE tinygemm (aarch64).
+// Both extend.cpp and fla.cpp call brgemm unconditionally; this wrapper
+// makes them work on aarch64.
+// ============================================================================
+
+#if defined(__aarch64__) || defined(__arm64__)
+
+// aarch64: brgemm_release is a no-op
+inline void brgemm_release_portable() {}
+
+#if defined(CPU_CAPABILITY_SVE)
+#include <arm_sve.h>
+#endif
+
+// Portable GEMM: bf16 input, fp32 output
+// A: [M, K] row-major bf16 (raw, not VNNI)
+// B: [K/2, N, 2] VNNI-packed bf16
+// C: [M, N] fp32 output
+template <typename scalar_t>
+inline void gemm_kernel_portable(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C) {
+#if defined(CPU_CAPABILITY_SVE)
+  const uint64_t vl_f32 = svcntw();
+  // B is in VNNI format: [K/2, N, 2] where pairs of bf16 are packed as fp32
+  // We iterate over M rows, and for each row do the full K reduction
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vc = add_C ? svld1_f32(pg, C + m * ldc + n) : svdup_f32(0.f);
+
+      // K/2 iterations, each processing 2 bf16 elements via bfdot
+      const int K2 = K >> 1;
+      for (int k = 0; k < K2; ++k) {
+        // A is row-major bf16: load 2 consecutive bf16 elements as 1 fp32
+        float a_pair;
+        std::memcpy(&a_pair, reinterpret_cast<const char*>(A + m * lda + k * 2), sizeof(float));
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_pair));
+
+        // B is VNNI: [K/2, N, 2], offset = k * ldb * 2 (in bf16 units) = k * ldb (in fp32 units)
+        // But ldb is already in bf16 units for the inner dim
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(B) + k * N + n));
+        vc = svbfdot_f32(vc, va, vb);
+      }
+      svst1_f32(pg, C + m * ldc + n, vc);
+    }
+  }
+#else
+  // Scalar fallback
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      float acc = add_C ? C[m * ldc + n] : 0.f;
+      for (int k = 0; k < K; ++k) {
+        float a_val = static_cast<float>(A[m * lda + k]);
+        // Decode VNNI: B[K/2, N, 2] -> element at (k, n) is at [(k/2) * N * 2 + n * 2 + (k%2)]
+        float b_val = static_cast<float>(B[(k >> 1) * N * 2 + n * 2 + (k & 1)]);
+        acc += a_val * b_val;
+      }
+      C[m * ldc + n] = acc;
+    }
+  }
+#endif
+}
+
+// Portable GEMM: bf16 input, bf16 output (via fp32 accumulation)
+// Same as above but converts fp32 result to bf16
+template <typename scalar_t>
+inline void gemm_kernel_portable_bf16out(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ C_bf16,
+    int ldc_bf16) {
+  gemm_kernel_portable(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+  // Convert fp32 C to bf16 C_bf16
+#if defined(CPU_CAPABILITY_SVE)
+  const uint64_t vl_f32 = svcntw();
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vf = svld1_f32(pg, C + m * ldc + n);
+      svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vf);
+      svst1_bf16(
+          svwhilelt_b16((uint32_t)n, (uint32_t)N), reinterpret_cast<bfloat16_t*>(C_bf16 + m * ldc_bf16 + n), vbf);
+    }
+  }
+#else
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      C_bf16[m * ldc_bf16 + n] = static_cast<scalar_t>(C[m * ldc + n]);
+    }
+  }
+#endif
+}
+
+#else  // x86
+
+// x86: direct passthrough to PyTorch brgemm
+inline void brgemm_release_portable() {
+  at::native::cpublas::brgemm_release();
+}
+
+template <typename scalar_t>
+inline void gemm_kernel_portable(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C) {
+  at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+}
+
+template <typename scalar_t>
+inline void gemm_kernel_portable_bf16out(
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    bool add_C,
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ C_bf16,
+    int ldc_bf16) {
+  at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add_C, A, B, C);
+  // On x86, brgemm outputs fp32; convert if needed
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  for (int m = 0; m < M; ++m) {
+    sgl_vec::convert(C + m * ldc, C_bf16 + m * ldc_bf16, N);
+  }
+}
+
+#endif  // __aarch64__

@@ -3,7 +3,7 @@
 
 namespace {
 
-// NB: avoid using `at::vec::map<>` on bfloat16 or half
+// NB: avoid using `sgl_vec::map<>` on bfloat16 or half
 // Llama4TextL2Norm
 template <typename scalar_t>
 void l2norm_kernel_impl(
@@ -12,8 +12,8 @@ void l2norm_kernel_impl(
     int64_t batch_size,
     int64_t hidden_size,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
@@ -30,7 +30,7 @@ void l2norm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
@@ -49,7 +49,7 @@ void l2norm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         x_fvec0 = x_fvec0 * scale_fvec;
         x_fvec1 = x_fvec1 * scale_fvec;
@@ -76,8 +76,8 @@ void rmsnorm_kernel_impl(
     const func_t& f,
     const vec_func_t& vf,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
@@ -94,7 +94,7 @@ void rmsnorm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
@@ -113,11 +113,11 @@ void rmsnorm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
 
         x_fvec0 = x_fvec0 * scale_fvec * vf(w_fvec0);
         x_fvec1 = x_fvec1 * scale_fvec * vf(w_fvec1);
@@ -151,8 +151,8 @@ void gemma3_rmsnorm_kernel_4d_impl(
     int64_t output_strideH,
     int64_t output_strideS,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
   at::parallel_for(0, batch_size * num_head * seq_len, 0, [&](int64_t begin, int64_t end) {
@@ -172,7 +172,7 @@ void gemma3_rmsnorm_kernel_4d_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
@@ -191,11 +191,11 @@ void gemma3_rmsnorm_kernel_4d_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
 
         x_fvec0 = x_fvec0 * scale_fvec * (w_fvec0 + one_fvec);
         x_fvec1 = x_fvec1 * scale_fvec * (w_fvec1 + one_fvec);
@@ -227,8 +227,8 @@ void fused_add_rmsnorm_kernel_impl(
     const func_t& f,
     const vec_func_t& vf,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
@@ -248,11 +248,11 @@ void fused_add_rmsnorm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         bVec r_bvec = bVec::loadu(residual_ptr + d);
         fVec r_fvec0, r_fvec1;
-        std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
+        std::tie(r_fvec0, r_fvec1) = sgl_vec::convert_to_float(r_bvec);
 
         x_fvec0 += r_fvec0;
         x_fvec1 += r_fvec1;
@@ -289,7 +289,7 @@ void fused_add_rmsnorm_kernel_impl(
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
 
         x_fvec0 = x_fvec0 * scale_fvec * vf(w_fvec0);
         x_fvec1 = x_fvec1 * scale_fvec * vf(w_fvec1);
@@ -315,8 +315,8 @@ void fused_rmsnorm_gated_kernel_impl(
     int64_t hidden_size,
     int64_t input_strideN,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   const fVec one = fVec(1.f);
 
   constexpr int kVecSize = bVec::size();
@@ -335,7 +335,7 @@ void fused_rmsnorm_gated_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
@@ -354,15 +354,15 @@ void fused_rmsnorm_gated_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
 
         bVec g_bvec = bVec::loadu(gate_ptr + d);
         fVec g_fvec0, g_fvec1;
-        std::tie(g_fvec0, g_fvec1) = at::vec::convert_to_float(g_bvec);
+        std::tie(g_fvec0, g_fvec1) = sgl_vec::convert_to_float(g_bvec);
         g_fvec0 = g_fvec0 / (one + g_fvec0.neg().exp_u20());
         g_fvec1 = g_fvec1 / (one + g_fvec1.neg().exp_u20());
 
@@ -396,8 +396,8 @@ void fused_add_layernorm_kernel_impl(
     int64_t hidden_size,
     int64_t input_strideN,
     float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
   at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
@@ -420,12 +420,12 @@ void fused_add_layernorm_kernel_impl(
       for (; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         if (residual_ptr != nullptr) {
           bVec r_bvec = bVec::loadu(residual_ptr + d);
           fVec r_fvec0, r_fvec1;
-          std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
+          std::tie(r_fvec0, r_fvec1) = sgl_vec::convert_to_float(r_bvec);
 
           x_fvec0 += r_fvec0;
           x_fvec1 += r_fvec1;
@@ -478,7 +478,7 @@ void fused_add_layernorm_kernel_impl(
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+        std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
 
         x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
         x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
@@ -528,7 +528,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t input_strideN = input.stride(0);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     rmsnorm_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
@@ -586,7 +586,7 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) 
   int64_t input_strideN = input.stride(0);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma_rmsnorm_kernel", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     Vec one_vec = Vec(float(1));
     rmsnorm_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
@@ -620,7 +620,7 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
     int64_t input_strideN = input.stride(0);
 
     AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma3_rmsnorm_kernel", [&] {
-      using Vec = at::vec::Vectorized<float>;
+      using Vec = sgl_vec::Vectorized<float>;
       Vec one_vec = Vec(float(1));
       rmsnorm_kernel_impl<scalar_t>(
           output.data_ptr<scalar_t>(),
@@ -721,7 +721,7 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_rmsnorm_kernel", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     fused_add_rmsnorm_kernel_impl<scalar_t>(
         input.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
@@ -760,7 +760,7 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma_fused_add_rmsnorm_kernel", [&] {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     Vec one_vec = Vec(float(1));
     fused_add_rmsnorm_kernel_impl<scalar_t>(
         input.data_ptr<scalar_t>(),

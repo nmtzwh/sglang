@@ -67,8 +67,8 @@ inline void pack_vnni<int8_t>(int8_t* __restrict__ packed, const int8_t* __restr
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
@@ -86,8 +86,8 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 
 template <typename scalar_t>
 inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
@@ -95,7 +95,7 @@ inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ inpu
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0, data1;
     bVec b_vec = bVec::loadu(input + d);
-    std::tie(data0, data1) = at::vec::convert_to_float(b_vec);
+    std::tie(data0, data1) = sgl_vec::convert_to_float(b_vec);
     data0.store(out + d);
     data1.store(out + d + fVec::size());
   }
@@ -107,8 +107,8 @@ inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ inpu
 template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
@@ -131,8 +131,8 @@ inline void scalar_sigmoid_and_mul(
     const float* __restrict__ bias,
     const scalar_t* __restrict__ mul,
     int SIZE) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   // scalar sigmoid
   const fVec one = fVec(1.f);
   fVec X;
@@ -149,7 +149,7 @@ inline void scalar_sigmoid_and_mul(
   for (int d = 0; d < SIZE; d += kVecSize) {
     bVec m_bvec = bVec::loadu(mul + d);
     fVec m_fvec0, m_fvec1;
-    std::tie(m_fvec0, m_fvec1) = at::vec::convert_to_float(m_bvec);
+    std::tie(m_fvec0, m_fvec1) = sgl_vec::convert_to_float(m_bvec);
     m_fvec0 = m_fvec0 * X;
     m_fvec1 = m_fvec1 * X;
 
@@ -246,6 +246,76 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       }
     };
     Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic bf16 GEMM micro-kernel using svbfdot
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
+    const uint64_t vl_f32 = svcntw();  // number of f32 elements per SVE vector
+
+    // Accumulate in fp32
+    // We process BLOCK_N columns in chunks of vl_f32
+    // C[m][n] = sum_k A[m][k] * B[k/2][n][2]  (VNNI layout)
+    constexpr int ROWS = BLOCK_M;
+
+    // Allocate fp32 accumulators for each row
+    // We process N in strips of vl_f32 (SVE vector width in fp32)
+    float acc[ROWS][BLOCK_N];
+
+    // Initialize accumulators
+    for (int m = 0; m < ROWS; ++m) {
+      for (int n = 0; n < BLOCK_N; ++n) {
+        acc[m][n] = has_bias ? bias[n] : 0.f;
+      }
+    }
+
+    // K dimension: VNNI format has pairs of bf16 packed as 32-bit
+    const int64_t K2 = K >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;
+
+    for (int64_t k = 0; k < K2; ++k) {
+      for (int m = 0; m < ROWS; ++m) {
+        // Broadcast A[m][k] (pair of bf16 as float32)
+        float a_val = a_ptr[m * lda2 + k];
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+
+        // Process N in SVE-width chunks
+        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
+        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+          svfloat32_t vc = svld1_f32(pg, acc[m] + n);
+          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
+          vc = svbfdot_f32(vc, va, vb);
+          svst1_f32(pg, acc[m] + n, vc);
+        }
+      }
+    }
+
+    // Store results: convert fp32 -> bf16
+    for (int m = 0; m < ROWS; ++m) {
+      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+        svbool_t pg32 = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+        svfloat32_t vf = svld1_f32(pg32, acc[m] + n);
+        // Convert fp32 to bf16 and store
+        svbfloat16_t vbf = svcvt_bf16_f32_x(pg32, vf);
+        // Store low half of bf16 vector (matches the fp32 element count)
+        svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
+      }
+    }
   }
 };
 #endif

@@ -232,8 +232,8 @@ void segment_gemm_kernel_impl(
 
 template <typename scalar_t>
 inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   fVec sum_fvec = fVec(float(0));
 
 // no remainder
@@ -241,7 +241,7 @@ inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
   for (int64_t d = 0; d < size; d += bVec::size()) {
     bVec x_bvec = bVec::loadu(x + d);
     fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+    std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
     sum_fvec += x_fvec0 * x_fvec0;
     sum_fvec += x_fvec1 * x_fvec1;
   }
@@ -251,8 +251,8 @@ inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
 // map2 from aten functional doesn't have fast bf16->fp32 conversion
 template <typename scalar_t>
 inline void map2(scalar_t* y, const scalar_t* x, const scalar_t* __restrict__ w, float scale, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   fVec scale_fvec = fVec(scale);
 
 // no remainder
@@ -260,10 +260,10 @@ inline void map2(scalar_t* y, const scalar_t* x, const scalar_t* __restrict__ w,
   for (int64_t d = 0; d < size; d += bVec::size()) {
     bVec x_bvec = bVec::loadu(x + d);
     fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+    std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
     bVec w_bvec = bVec::loadu(w + d);
     fVec w_fvec0, w_fvec1;
-    std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+    std::tie(w_fvec0, w_fvec1) = sgl_vec::convert_to_float(w_bvec);
     x_fvec0 = x_fvec0 * scale_fvec * w_fvec0;
     x_fvec1 = x_fvec1 * scale_fvec * w_fvec1;
     bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
@@ -334,6 +334,26 @@ inline void rotary<at::BFloat16>(
     b = _mm512_mask_permutex2var_ps(out1, 0xffff, idy2, out2);
 
     _mm512_storeu_si512(reinterpret_cast<__m512i*>((out + d)), (__m512i)(_mm512_cvtne2ps_pbh(b, a)));
+  }
+}
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+template <>
+inline void rotary<at::BFloat16>(
+    const at::BFloat16* input, at::BFloat16* out, const at::BFloat16* cos, const at::BFloat16* sin, int64_t size) {
+  // Process in scalar pairs: input is [x0, x1, x0, x1, ...] interleaved format
+  // Each pair (x0, x1) is rotated by (cos, sin)
+  for (int64_t d = 0; d < size; d += 2) {
+    int64_t d2 = d >> 1;
+    float c = static_cast<float>(cos[d2]);
+    float s = static_cast<float>(sin[d2]);
+    float in1 = static_cast<float>(input[d]);
+    float in2 = static_cast<float>(input[d + 1]);
+    float out1 = in1 * c - in2 * s;
+    float out2 = in2 * c + in1 * s;
+    out[d] = static_cast<at::BFloat16>(out1);
+    out[d + 1] = static_cast<at::BFloat16>(out2);
   }
 }
 #endif

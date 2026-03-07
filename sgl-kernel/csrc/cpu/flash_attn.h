@@ -5,7 +5,7 @@
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
   constexpr int kVecSize = Vec::size();
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
   int d = 0;
@@ -21,8 +21,8 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
 template <typename scalar_t, int BLOCK_N>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input) {
   static_assert(BLOCK_N % 32 == 0);
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int COLS = BLOCK_N / 16;
   auto store = [&](auto i) {
@@ -40,8 +40,8 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_fvec = fVec(s);
   int d = 0;
@@ -101,34 +101,34 @@ struct flash_attn_softmax {
       int padded_n_size,
       int head_size_v,
       const float sm_scale) {
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     const Vec scale_vec = Vec(sm_scale);
     float* s_delta = s_i;
     for (int row = 0; row < m_size; ++row) {
       // s_i <- s_i * scale
-      at::vec::map<float>(
+      sgl_vec::map<float>(
           [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
 
       // m_i: max value per row
-      float m_i = at::vec::reduce_all<float>(
-          [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
+      float m_i = sgl_vec::reduce_all<float>(
+          [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
       m_i = std::max(m_i, m_prime[row]);
 
       // m_delta <- exp(m' - m_i)
       float m_delta = std::exp(m_prime[row] - m_i);
 
       // s_delta <- exp(s_i - m_i)
-      at::vec::map<float>(
+      sgl_vec::map<float>(
           [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
 
       // s' <- s' * m_delta + sum(s_delta)
       s_prime[row] *= m_delta;
-      s_prime[row] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+      s_prime[row] += sgl_vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
 
       m_prime[row] = m_i;
 
       // v' <- v' * m_delta
-      at::vec::map<float>(
+      sgl_vec::map<float>(
           [m_delta](Vec x) { return x * Vec(m_delta); },
           v_prime + row * head_size_v,
           v_prime + row * head_size_v,
@@ -238,6 +238,89 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
       if (v_remainder > 0) {
         va = _mm512_mul_ps(_mm512_maskz_loadu_ps(vmask1, v_prime + m * head_size_v + k), vmdelta);
         _mm512_mask_storeu_ps(reinterpret_cast<__m512*>(v_prime + m * head_size_v + k), vmask1, va);
+      }
+    }
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic flash attention softmax for bf16
+template <int BLOCK_M, int BLOCK_N>
+struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      float* __restrict__ s_i,
+      at::BFloat16* __restrict__ s_delta2,
+      float* __restrict__ v_prime,
+      float* __restrict__ s_prime,
+      float* __restrict__ m_prime,
+      int m_size,
+      int n_size,
+      int padded_n_size,
+      int head_size_v,
+      const float sm_scale) {
+    const uint64_t vl_f32 = svcntw();
+    constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+
+    for (int m = 0; m < m_size; ++m) {
+      float* s_row = s_i + m * BLOCK_N;
+
+      // Pass 1: scale and find max
+      float m_i = NEG_INF;
+      svfloat32_t vmax = svdup_f32(NEG_INF);
+      svfloat32_t vscale = svdup_f32(sm_scale);
+      for (int n = 0; n < n_size; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)n_size);
+        svfloat32_t vs = svld1_f32(pg, s_row + n);
+        vs = svmul_f32_x(pg, vs, vscale);
+        vmax = svmax_f32_m(pg, vmax, vs);
+      }
+      m_i = svmaxv_f32(svptrue_b32(), vmax);
+      m_i = std::max(m_i, m_prime[m]);
+
+      float m_delta = std::exp(m_prime[m] - m_i);
+
+      // Pass 2: exp(s_i * scale - m_i) and sum
+      svfloat32_t vsum = svdup_f32(0.f);
+      svfloat32_t vm_i = svdup_f32(m_i);
+      for (int n = 0; n < n_size; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)n_size);
+        svfloat32_t vs = svld1_f32(pg, s_row + n);
+        vs = svmul_f32_x(pg, vs, vscale);
+        vs = sve_fexp_u20(pg, svsub_f32_x(pg, vs, vm_i));
+        vsum = svadd_f32_m(pg, vsum, vs);
+        // Convert to bf16 and store
+        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vs);
+        svst1_bf16(
+            svwhilelt_b16((uint32_t)n, (uint32_t)n_size),
+            reinterpret_cast<bfloat16_t*>(s_delta2 + m * BLOCK_N + n),
+            vbf);
+      }
+
+      // s' <- s' * m_delta + sum(s_delta)
+      s_prime[m] *= m_delta;
+      s_prime[m] += svaddv_f32(svptrue_b32(), vsum);
+      m_prime[m] = m_i;
+
+      // Pad s_delta with 0
+      int pad_size = padded_n_size - n_size;
+      if (pad_size > 0) {
+        for (int n = n_size; n < padded_n_size; n += vl_f32) {
+          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)padded_n_size);
+          svst1_bf16(
+              svwhilelt_b16((uint32_t)n, (uint32_t)padded_n_size),
+              reinterpret_cast<bfloat16_t*>(s_delta2 + m * BLOCK_N + n),
+              svdup_bf16(0));
+        }
+      }
+
+      // v' <- v' * m_delta
+      svfloat32_t vmd = svdup_f32(m_delta);
+      for (int k = 0; k < head_size_v; k += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)head_size_v);
+        svfloat32_t vv = svld1_f32(pg, v_prime + m * head_size_v + k);
+        vv = svmul_f32_x(pg, vv, vmd);
+        svst1_f32(pg, v_prime + m * head_size_v + k, vv);
       }
     }
   }

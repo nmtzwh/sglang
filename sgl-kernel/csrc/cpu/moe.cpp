@@ -27,14 +27,14 @@ namespace {
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
   const Vec data_vec(val);
-  at::vec::map<scalar_t>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
+  sgl_vec::map<scalar_t>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
 }
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
@@ -45,8 +45,8 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
   int64_t d;
@@ -65,8 +65,8 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
 // acc from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   if (topk == 1) {
     // do copy for topk = 1
@@ -81,7 +81,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
       for (int t = 0; t < topk; ++t) {
         bVec x_bvec = bVec::loadu(input + t * K + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec0 += x_fvec0;
         sum_fvec1 += x_fvec1;
@@ -107,8 +107,8 @@ inline void add_mul_stub(
     const scalar_t* __restrict__ input2,
     float scale,
     int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_vec = fVec(scale);
   int64_t d;
@@ -119,7 +119,7 @@ inline void add_mul_stub(
 
     bVec y_bvec = bVec::loadu(input2 + d);
     fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
+    std::tie(y0, y1) = sgl_vec::convert_to_float(y_bvec);
 
     x0 = x0 + y0 * s_vec;
     x1 = x1 + y1 * s_vec;
@@ -154,9 +154,9 @@ int moe_align_block_size(
     }
   });
 
-  using iVec = at::vec::Vectorized<int32_t>;
+  using iVec = sgl_vec::Vectorized<int32_t>;
   for (int t = 0; t < num_threads; ++t) {
-    at::vec::map2<int32_t>(
+    sgl_vec::map2<int32_t>(
         [](iVec x, iVec y) { return x + y; }, T_INDEX(t + 1), T_INDEX(t + 1), T_INDEX(t), num_experts);
   }
 
@@ -234,8 +234,8 @@ inline void silu_and_mul(
     const float* __restrict__ input1,  // y: y0, y1
     int64_t m_size,
     int64_t N) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   const fVec one = fVec(1.f);
 
@@ -339,7 +339,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
       Unroll<ROWS * COLS>{}(compute, k);
     }
 
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     const Vec one = Vec(1.f);
     auto storec = [&](auto i) {
       constexpr int row = i / COLS;
@@ -363,6 +363,81 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
       }
     };
     Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic dual GEMM for MoE gate+up projection with fused SiLU*mul
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B0,
+      const at::BFloat16* __restrict__ B1,
+      at::BFloat16* __restrict__ C,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
+    constexpr int ROWS = BLOCK_M;
+    const uint64_t vl_f32 = svcntw();
+
+    // Accumulate gate (C0) and up (C1) in fp32
+    float acc0[ROWS][BLOCK_N];
+    float acc1[ROWS][BLOCK_N];
+    for (int m = 0; m < ROWS; ++m) {
+      for (int n = 0; n < BLOCK_N; ++n) {
+        acc0[m][n] = 0.f;
+        acc1[m][n] = 0.f;
+      }
+    }
+
+    const int64_t K2 = K >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;
+
+    for (int64_t k = 0; k < K2; ++k) {
+      for (int m = 0; m < ROWS; ++m) {
+        float a_val = a_ptr[m * lda2 + k];
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+
+        const float* b0_row = reinterpret_cast<const float*>(B0) + k * ldb2;
+        const float* b1_row = reinterpret_cast<const float*>(B1) + k * ldb2;
+
+        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+          svfloat32_t vc0 = svld1_f32(pg, acc0[m] + n);
+          svfloat32_t vc1 = svld1_f32(pg, acc1[m] + n);
+          svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg, b0_row + n));
+          svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg, b1_row + n));
+          vc0 = svbfdot_f32(vc0, va, vb0);
+          vc1 = svbfdot_f32(vc1, va, vb1);
+          svst1_f32(pg, acc0[m] + n, vc0);
+          svst1_f32(pg, acc1[m] + n, vc1);
+        }
+      }
+    }
+
+    // Store: SiLU(acc0) * acc1 -> bf16
+    for (int m = 0; m < ROWS; ++m) {
+      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+        svfloat32_t vx = svld1_f32(pg, acc0[m] + n);
+        svfloat32_t vy = svld1_f32(pg, acc1[m] + n);
+        // SiLU: x / (1 + exp(-x))
+        svfloat32_t vneg_x = svneg_f32_x(pg, vx);
+        svfloat32_t vexp = sve_fexp_u20(pg, vneg_x);
+        svfloat32_t vdenom = svadd_f32_x(pg, svdup_f32(1.f), vexp);
+        svfloat32_t vsilu = svdiv_f32_x(pg, vx, vdenom);
+        // mul
+        svfloat32_t vresult = svmul_f32_x(pg, vsilu, vy);
+        // convert to bf16 and store
+        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vresult);
+        svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
+      }
+    }
   }
 };
 #endif
@@ -490,6 +565,60 @@ struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
       _mm512_storeu_ps(reinterpret_cast<__m512*>(C + row * ldc + col * 16), vc[i]);
     };
     Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic MoE down projection GEMM (accumulate in fp32)
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      float* __restrict__ C,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
+    constexpr int ROWS = BLOCK_M;
+    const uint64_t vl_f32 = svcntw();
+
+    float acc[ROWS][BLOCK_N];
+    for (int m = 0; m < ROWS; ++m) {
+      for (int n = 0; n < BLOCK_N; ++n) {
+        acc[m][n] = 0.f;
+      }
+    }
+
+    const int64_t K2 = K >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;
+
+    for (int64_t k = 0; k < K2; ++k) {
+      for (int m = 0; m < ROWS; ++m) {
+        float a_val = a_ptr[m * lda2 + k];
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+
+        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
+        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+          svfloat32_t vc = svld1_f32(pg, acc[m] + n);
+          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
+          vc = svbfdot_f32(vc, va, vb);
+          svst1_f32(pg, acc[m] + n, vc);
+        }
+      }
+    }
+
+    for (int m = 0; m < ROWS; ++m) {
+      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+        svfloat32_t vc = svld1_f32(pg, acc[m] + n);
+        svst1_f32(pg, C + m * ldc + n, vc);
+      }
+    }
   }
 };
 #endif

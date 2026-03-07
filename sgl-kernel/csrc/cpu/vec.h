@@ -4,32 +4,47 @@
 #define CPU_CAPABILITY_AVX512
 #endif
 
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#ifndef CPU_CAPABILITY_SVE
+#define CPU_CAPABILITY_SVE
+#endif
+#include <arm_sve.h>
+#endif
+
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 
+#include "vec_sve512.h"
+
 namespace {
 
-using namespace at::vec;
+#if defined(CPU_CAPABILITY_SVE) && defined(SGLANG_SVE512_VEC)
+namespace sgl_vec = sgl::vec;
+#else
+namespace sgl_vec = at::vec;
+#endif
+
+using namespace sgl_vec;
 
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
 inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, const Vectorized<float>& b) {
-  return at::vec::convert_from_float<scalar_t>(a, b);
+  return sgl_vec::convert_from_float<scalar_t>(a, b);
 }
 
 // allow f16, bf16
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   bVec x_vec = bVec::loadu(data);
   fVec x0, x1;
-  std::tie(x0, x1) = at::vec::convert_to_float(x_vec);
+  std::tie(x0, x1) = sgl_vec::convert_to_float(x_vec);
   return std::make_tuple(x0, x1);
 }
 
 // allow  f32
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const float* __restrict__ data) {
-  using fVec = at::vec::Vectorized<float>;
+  using fVec = sgl_vec::Vectorized<float>;
   fVec x0 = fVec::loadu(data);
   fVec x1 = fVec::loadu(data + fVec::size());
   return std::make_tuple(x0, x1);
@@ -37,7 +52,7 @@ inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const fl
 
 #if defined(CPU_CAPABILITY_AVX512)
 
-// `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
+// `sgl_vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
 // use native instruction for bfloat16->float32 conversion
 template <>
 inline Vectorized<at::BFloat16>
@@ -147,6 +162,132 @@ inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
 
 #endif
 
+#if defined(CPU_CAPABILITY_SVE)
+
+// ============================================================
+// SVE helper: get number of 32-bit float elements per vector
+// ============================================================
+inline uint64_t sve_float_count() {
+  return svcntw();
+}
+
+// ============================================================
+// SVE BF16 <-> FP32 conversion (VL-agnostic)
+// ============================================================
+
+// Convert bf16 to fp32 by shifting left 16 bits
+// Input: N bf16 values loaded as uint16, output: N fp32 values
+// Processes the low half of a bf16 vector
+inline svfloat32_t sve_cvt_bf16_to_fp32_low(svbfloat16_t src) {
+  svuint16_t u16 = svreinterpret_u16(src);
+  svuint32_t lo = svunpklo_u32(u16);
+  lo = svlsl_n_u32_x(svptrue_b32(), lo, 16);
+  return svreinterpret_f32(lo);
+}
+
+// Processes the high half of a bf16 vector
+inline svfloat32_t sve_cvt_bf16_to_fp32_high(svbfloat16_t src) {
+  svuint16_t u16 = svreinterpret_u16(src);
+  svuint32_t hi = svunpkhi_u32(u16);
+  hi = svlsl_n_u32_x(svptrue_b32(), hi, 16);
+  return svreinterpret_f32(hi);
+}
+
+// Convert fp32 to bf16 with round-to-nearest-even
+inline svbfloat16_t sve_cvt_fp32_to_bf16(svfloat32_t lo, svfloat32_t hi) {
+  return svcvtnt_bf16_x(svcvt_bf16_x(svptrue_b32(), lo), svptrue_b32(), hi);
+}
+
+// ============================================================
+// SVE FP16 -> FP32 conversion
+// ============================================================
+inline svfloat32_t sve_cvt_fp16_to_fp32_low(svfloat16_t src) {
+  return svcvt_f32_f16_x(svptrue_b32(), svreinterpret_f16(svunpklo_u32(svreinterpret_u16(src))));
+}
+
+inline svfloat32_t sve_cvt_fp16_to_fp32_high(svfloat16_t src) {
+  return svcvt_f32_f16_x(svptrue_b32(), svreinterpret_f16(svunpkhi_u32(svreinterpret_u16(src))));
+}
+
+// ============================================================
+// SVE FP8 (e4m3) -> BF16 conversion (VL-agnostic)
+// ============================================================
+// Port of the AVX-512 cvt_e4m3_bf16_intrinsic_no_nan using SVE integer ops
+inline svbfloat16_t sve_cvt_e4m3_bf16_no_nan(svuint8_t fp8_vec) {
+  const svbool_t pg16 = svptrue_b16();
+  svuint16_t x = svunpklo_u16(fp8_vec);
+  svuint16_t combined = svadd_u16_x(pg16, x, svdup_u16(0x0780));
+  combined = svlsl_n_u16_x(pg16, combined, 4);
+  combined = svand_u16_x(pg16, combined, svdup_u16(0x87f0));
+  combined = svadd_u16_x(pg16, combined, svdup_u16(0x3c00));
+  svbool_t is_nonzero = svcmpne_u16(pg16, x, svdup_u16(0));
+  svuint16_t result = svsel_u16(is_nonzero, combined, svdup_u16(0));
+  return svreinterpret_bf16(result);
+}
+
+// FP8->BF16 with denorm support
+inline svbfloat16_t sve_cvt_e4m3_bf16_with_denorm(svuint8_t fp8_vec) {
+  const svbool_t pg16 = svptrue_b16();
+  svuint16_t x = svunpklo_u16(fp8_vec);
+
+  // Compute lg2mant for subnormal handling
+  svuint16_t lg2mant = svdup_u16(0);
+  svbool_t has_bit1 = svcmpne_u16(pg16, svand_u16_x(pg16, x, svdup_u16(2)), svdup_u16(0));
+  lg2mant = svsel_u16(has_bit1, svdup_u16(1), lg2mant);
+  svbool_t has_bit2 = svcmpne_u16(pg16, svand_u16_x(pg16, x, svdup_u16(4)), svdup_u16(0));
+  lg2mant = svsel_u16(has_bit2, svdup_u16(2), lg2mant);
+
+  // Normal path: mantissa and exponent
+  svuint16_t mantissa = svlsl_n_u16_x(pg16, svand_u16_x(pg16, x, svdup_u16(7)), 4);
+  svuint16_t exp_field =
+      svadd_u16_x(pg16, svlsr_n_u16_x(pg16, svand_u16_x(pg16, x, svdup_u16(120)), 3), svdup_u16(120));
+  svuint16_t normal_val = svorr_u16_x(pg16, mantissa, svlsl_n_u16_x(pg16, exp_field, 7));
+
+  // Subnormal path
+  svuint16_t sub_mant = svand_u16_x(
+      pg16,
+      svlsl_u16_x(pg16, svand_u16_x(pg16, x, svdup_u16(3)), svsub_u16_x(pg16, svdup_u16(7), lg2mant)),
+      svdup_u16(0x007f));
+  svuint16_t sub_exp = svlsl_n_u16_x(pg16, svadd_u16_x(pg16, lg2mant, svdup_u16(118)), 7);
+  svuint16_t sub_val = svorr_u16_x(pg16, sub_mant, sub_exp);
+
+  // Select normal vs subnormal based on exponent bits
+  svbool_t has_exp = svcmpne_u16(pg16, svand_u16_x(pg16, x, svdup_u16(120)), svdup_u16(0));
+  svuint16_t nonsign = svsel_u16(has_exp, normal_val, sub_val);
+
+  // Zero mask
+  svbool_t is_nonzero = svcmpne_u16(pg16, svand_u16_x(pg16, x, svdup_u16(127)), svdup_u16(0));
+  nonsign = svsel_u16(is_nonzero, nonsign, svdup_u16(0));
+
+  // Add sign bit
+  svuint16_t sign = svlsl_n_u16_x(pg16, svand_u16_x(pg16, x, svdup_u16(128)), 8);
+  return svreinterpret_bf16(svorr_u16_x(pg16, nonsign, sign));
+}
+
+inline svbfloat16_t SVE_CVT_FP8_TO_BF16(svuint8_t a) {
+#ifdef SGLANG_CPU_FP8_CVT_FTZ
+  return sve_cvt_e4m3_bf16_no_nan(a);
+#else
+  return sve_cvt_e4m3_bf16_with_denorm(a);
+#endif
+}
+
+// Faster FP8->BF16 (no denorm, no NaN) - matches CVT_FP8_TO_BF16_EXT
+inline svbfloat16_t SVE_CVT_FP8_TO_BF16_EXT(svuint8_t a) {
+  const svbool_t pg16 = svptrue_b16();
+  svuint16_t x = svunpklo_u16(a);
+  svuint16_t vsign = svand_u16_x(pg16, x, svdup_u16(0x80));
+  vsign = svlsl_n_u16_x(pg16, vsign, 8);
+  svuint16_t vexp_and_mant = svand_u16_x(pg16, x, svdup_u16(0x7F));
+  vexp_and_mant = svlsl_n_u16_x(pg16, vexp_and_mant, 4);
+  // OR all three: vsign | 0x4000 | vexp_and_mant
+  svuint16_t result = svorr_u16_x(pg16, vsign, svdup_u16(0x4000));
+  result = svorr_u16_x(pg16, result, vexp_and_mant);
+  return svreinterpret_bf16(result);
+}
+
+#endif  // CPU_CAPABILITY_SVE
+
 // vector to scalar reduction
 #if defined(CPU_CAPABILITY_AVX512)
 inline float vec_reduce_sum(const Vectorized<float>& a) {
@@ -155,6 +296,32 @@ inline float vec_reduce_sum(const Vectorized<float>& a) {
 
 inline float vec_reduce_max(const Vectorized<float>& a) {
   return _mm512_reduce_max_ps(__m512(a));
+}
+#elif defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic horizontal reductions
+inline float vec_reduce_sum(const Vectorized<float>& a) {
+  // Vectorized<float> stores data as array; reduce through SVE
+  const float* data = reinterpret_cast<const float*>(&a);
+  constexpr int kSize = Vectorized<float>::size();
+  float sum = 0.f;
+  for (int i = 0; i < kSize; i += svcntw()) {
+    svbool_t pg = svwhilelt_b32(i, kSize);
+    svfloat32_t v = svld1_f32(pg, data + i);
+    sum += svaddv_f32(pg, v);
+  }
+  return sum;
+}
+
+inline float vec_reduce_max(const Vectorized<float>& a) {
+  const float* data = reinterpret_cast<const float*>(&a);
+  constexpr int kSize = Vectorized<float>::size();
+  float mx = -std::numeric_limits<float>::infinity();
+  for (int i = 0; i < kSize; i += svcntw()) {
+    svbool_t pg = svwhilelt_b32(i, kSize);
+    svfloat32_t v = svld1_f32(pg, data + i);
+    mx = std::max(mx, svmaxv_f32(pg, v));
+  }
+  return mx;
 }
 #else
 inline float vec_reduce_sum(const Vectorized<float>& a) {
@@ -222,6 +389,50 @@ inline void quantize_row_int8<at::BFloat16>(
     __m128i i0 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va0), off));
     __m128i i1 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va1), off));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(Aq + k), _mm256_set_m128i(i1, i0));
+  }
+  As = scale;
+}
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+template <>
+inline void quantize_row_int8<at::BFloat16>(
+    uint8_t* __restrict__ Aq, float& As, const at::BFloat16* __restrict__ A, int64_t K, float eps) {
+  const uint64_t vl = svcntw();  // number of f32 elements per SVE vector
+
+  // Pass 1: find abs max using SVE
+  float amax = 0.f;
+  svfloat32_t vamax = svdup_f32(0.f);
+  for (int64_t k = 0; k < K; k += vl) {
+    svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
+    // Load bf16 and convert to fp32
+    svbfloat16_t vbf = svreinterpret_bf16(
+        svld1_u16(svwhilelt_b16((uint32_t)k, (uint32_t)K), reinterpret_cast<const uint16_t*>(A + k)));
+    svfloat32_t vf = sve_cvt_bf16_to_fp32_low(vbf);
+    svfloat32_t vabs = svabs_f32_x(pg, vf);
+    vamax = svmax_f32_x(pg, vamax, vabs);
+  }
+  amax = svmaxv_f32(svptrue_b32(), vamax);
+  amax = std::max(amax, eps);
+  const float scale = amax / 127;
+  const float inv_scale = 127 / amax;
+
+  // Pass 2: quantize
+  svfloat32_t vd = svdup_f32(inv_scale);
+  svfloat32_t voff = svdup_f32(128.f);
+  for (int64_t k = 0; k < K; k += vl) {
+    svbool_t pg = svwhilelt_b32((uint32_t)k, (uint32_t)K);
+    svbfloat16_t vbf = svreinterpret_bf16(
+        svld1_u16(svwhilelt_b16((uint32_t)k, (uint32_t)K), reinterpret_cast<const uint16_t*>(A + k)));
+    svfloat32_t vf = sve_cvt_bf16_to_fp32_low(vbf);
+    vf = svmul_f32_x(pg, vf, vd);
+    vf = svrintn_f32_x(pg, vf);  // round to nearest
+    vf = svadd_f32_x(pg, vf, voff);
+    svint32_t vi = svcvt_s32_f32_x(pg, vf);
+    // Narrow to uint8 and store
+    svuint16_t vn16 = svqxtunb_s32(vi);
+    svuint8_t vn8 = svqxtunb_s16(svreinterpret_s16(vn16));
+    svst1b_u32(pg, Aq + k, svreinterpret_u32(svunpklo_u16(vn8)));
   }
   As = scale;
 }
@@ -372,6 +583,100 @@ inline __attribute__((always_inline)) __m512 _mm512_fexp_u20_ps(const __m512 val
   casted_integer = _mm512_mask_mov_epi32(casted_integer, max_mask, vec_infinity);
   // final interpretation to float
   return _mm512_castsi512_ps(casted_integer);
+}
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// ============================================================
+// SVE VL-agnostic fast exp (matches _mm512_fexp_u20_ps)
+// ============================================================
+// Fast Exponential Computation on SIMD Architectures (Malossi et al.)
+// exp(x) = 2**(x * log2(e)) = 2**xi * 2**xf
+// 2**xf approximated with degree-3 polynomial via Horner scheme
+inline __attribute__((always_inline)) svfloat32_t sve_fexp_u20(svbool_t pg, svfloat32_t values) {
+  const svfloat32_t vc0 = svdup_f32(0.00010703434948458272f);
+  const svfloat32_t vc1 = svdup_f32(0.30354260500649682f);
+  const svfloat32_t vc2 = svdup_f32(-0.22433836478672356f);
+  const svfloat32_t vc3 = svdup_f32(-0.079204240219773236f);
+
+  union {
+    uint32_t u;
+    float f;
+  } log2ef_u = {0x3fb8aa3b};
+  const svfloat32_t vec_exp_log2ef = svdup_f32(log2ef_u.f);
+
+  const svfloat32_t vec_a = svdup_f32(std::pow(2.f, 23.f) / std::log2(2.f));
+  const svfloat32_t vec_b = svdup_f32(std::pow(2.f, 23.f) * 127.f);
+
+  union {
+    uint32_t u;
+    float f;
+  } ln_min_u = {0xc2aeac50};
+  union {
+    uint32_t u;
+    float f;
+  } ln_max_u = {0x42b17218};
+  const svfloat32_t vec_ln_flt_min = svdup_f32(ln_min_u.f);
+  const svfloat32_t vec_ln_flt_max = svdup_f32(ln_max_u.f);
+  const svuint32_t vec_infinity = svdup_u32(0x7F800000);
+  const svuint32_t vec_zero = svdup_u32(0);
+
+  svbool_t min_mask = svcmplt_f32(pg, values, vec_ln_flt_min);
+  svbool_t max_mask = svcmpgt_f32(pg, values, vec_ln_flt_max);
+
+  svfloat32_t vec_src = svmul_f32_x(pg, values, vec_exp_log2ef);
+  svfloat32_t vec_floor = svrintm_f32_x(pg, vec_src);
+  svfloat32_t vec_fractional = svsub_f32_x(pg, vec_src, vec_floor);
+
+  // Horner: ((c3 * x + c2) * x + c1) * x + c0
+  svfloat32_t vec_res = svmla_f32_x(pg, vc2, vec_fractional, vc3);
+  vec_res = svmla_f32_x(pg, vc1, vec_fractional, vec_res);
+  vec_res = svmla_f32_x(pg, vc0, vec_fractional, vec_res);
+
+  vec_src = svsub_f32_x(pg, vec_src, vec_res);
+  svfloat32_t tmp = svmla_f32_x(pg, vec_b, vec_a, vec_src);
+  svuint32_t casted = svreinterpret_u32(svcvt_s32_f32_z(pg, tmp));
+
+  // Boundary conditions
+  casted = svsel_u32(min_mask, vec_zero, casted);
+  casted = svsel_u32(max_mask, vec_infinity, casted);
+  return svreinterpret_f32(casted);
+}
+#endif  // CPU_CAPABILITY_SVE
+
+// ============================================================
+// Scalar fallback transpose for non-AVX512 platforms
+// (needed by vec_pack.h on aarch64)
+// ============================================================
+#if !defined(CPU_CAPABILITY_AVX512)
+// transpose_16x16_32bit using scalar operations
+// v is an array of 16 vectors, each holding 16 x 32-bit elements
+// On aarch64, this is stored as plain arrays
+inline void transpose_16x16_32bit_scalar(uint32_t v[16][16]) {
+  for (int i = 0; i < 16; ++i) {
+    for (int j = i + 1; j < 16; ++j) {
+      std::swap(v[i][j], v[j][i]);
+    }
+  }
+}
+
+// transpose from [2, N] to [N, 2] for 16-bit elements
+// Interleaves two rows of 16-bit elements: {a0,a1,...} + {b0,b1,...} -> {a0,b0,a1,b1,...}
+inline void transpose_2xN_16bit_scalar(
+    uint16_t* __restrict__ dst0,
+    uint16_t* __restrict__ dst1,
+    const uint16_t* __restrict__ r0,
+    const uint16_t* __restrict__ r1,
+    int N) {
+  int half = N / 2;
+  for (int i = 0; i < half; ++i) {
+    dst0[i * 2 + 0] = r0[i];
+    dst0[i * 2 + 1] = r1[i];
+  }
+  for (int i = half; i < N; ++i) {
+    dst1[(i - half) * 2 + 0] = r0[i];
+    dst1[(i - half) * 2 + 1] = r1[i];
+  }
 }
 #endif
 

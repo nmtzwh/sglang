@@ -6,7 +6,7 @@ namespace {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
@@ -23,8 +23,8 @@ inline void copy_stub<uint8_t>(uint8_t* __restrict__ out, const uint8_t* __restr
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
   int64_t d;
@@ -43,8 +43,8 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
 // acc from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   if (topk == 1) {
     // do copy for topk = 1
@@ -59,7 +59,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
       for (int t = 0; t < topk; ++t) {
         bVec x_bvec = bVec::loadu(input + t * K + d);
         fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
         sum_fvec0 += x_fvec0;
         sum_fvec1 += x_fvec1;
@@ -85,8 +85,8 @@ inline void add_mul_stub(
     const scalar_t* __restrict__ input2,
     float scale,
     int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_vec = fVec(scale);
   int64_t d;
@@ -97,7 +97,7 @@ inline void add_mul_stub(
 
     bVec y_bvec = bVec::loadu(input2 + d);
     fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
+    std::tie(y0, y1) = sgl_vec::convert_to_float(y_bvec);
 
     x0 = x0 + y0 * s_vec;
     x1 = x1 + y1 * s_vec;
@@ -153,8 +153,8 @@ inline void silu_and_mul(
     vc1[col] = _mm512_mul_ps(_mm512_mul_ps(vc1[col], vas), vbs1[col]);
   };
 
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   const fVec one = fVec(1.f);
   auto silu_and_mul = [&](auto col) {
     fVec x = fVec(vc0[col]);
@@ -329,7 +329,7 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
     };
     Unroll<ROWS * COLS>{}(scalec);
 
-    using Vec = at::vec::Vectorized<float>;
+    using Vec = sgl_vec::Vectorized<float>;
     const Vec one = Vec(1.f);
     auto storec = [&](auto i) {
       constexpr int row = i / COLS;

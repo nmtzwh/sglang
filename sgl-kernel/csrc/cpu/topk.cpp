@@ -5,8 +5,8 @@ namespace {
 
 template <typename scalar_t, int SIZE>
 inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
 
@@ -16,18 +16,18 @@ inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input)
     // SIZE = 1, 2, 4, 8, 16; only the top half is used
     bVec x_bvec = bVec::loadu(input, SIZE);
     fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+    std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
     x_fvec0 = fVec::set(max_fvec, x_fvec0, SIZE);
-    max_fvec = at::vec::maximum(max_fvec, x_fvec0);
+    max_fvec = sgl_vec::maximum(max_fvec, x_fvec0);
     x_fvec0.store(out, SIZE);
   } else {
     for (int d = 0; d < SIZE; d += kVecSize) {
       bVec x_bvec = bVec::loadu(input + d);
       fVec x_fvec0, x_fvec1;
-      std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+      std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
-      max_fvec = at::vec::maximum(max_fvec, x_fvec0);
-      max_fvec = at::vec::maximum(max_fvec, x_fvec1);
+      max_fvec = sgl_vec::maximum(max_fvec, x_fvec0);
+      max_fvec = sgl_vec::maximum(max_fvec, x_fvec1);
       x_fvec0.store(out + d);
       x_fvec1.store(out + d + fVec::size());
     }
@@ -138,8 +138,8 @@ void grouped_topk_kernel_impl(
 
 template <typename scalar_t, int SIZE>
 inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   const fVec one = fVec(1.f);
 
@@ -147,7 +147,7 @@ inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input)
   for (int d = 0; d < SIZE; d += kVecSize) {
     bVec x_bvec = bVec::loadu(input + d);
     fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+    std::tie(x_fvec0, x_fvec1) = sgl_vec::convert_to_float(x_bvec);
 
     x_fvec0 = one / (one + x_fvec0.neg().exp_u20());
     x_fvec1 = one / (one + x_fvec1.neg().exp_u20());
@@ -165,7 +165,7 @@ void topk_sigmoid_kernel_impl(
     int64_t num_tokens,
     int64_t topk,
     bool renormalize) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
   const int64_t num_experts_per_group = NUM_EXPERTS;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float scores[NUM_EXPERTS];
@@ -173,10 +173,10 @@ void topk_sigmoid_kernel_impl(
     std::vector<elem_t> queue(num_experts_per_group);
 
     for (int64_t i = begin; i < end; ++i) {
-      at::vec::convert<scalar_t, float>(gating_output + i * NUM_EXPERTS, scores, NUM_EXPERTS);
+      sgl_vec::convert<scalar_t, float>(gating_output + i * NUM_EXPERTS, scores, NUM_EXPERTS);
 
-      float gmax = at::vec::reduce_all<float>(
-          [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, scores, num_experts_per_group);
+      float gmax = sgl_vec::reduce_all<float>(
+          [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); }, scores, num_experts_per_group);
 
       // find position of first max,
       // note that we may have multiple max values.
@@ -255,8 +255,8 @@ void topk_softmax_kernel_impl(
 template <typename scalar_t, typename param_t, int SIZE>
 inline void
 apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const param_t* __restrict__ bias) {
-  using fVec = at::vec::Vectorized<float>;
-  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
   auto vec_size = bVec::size();
   int d = 0;
   for (; d <= SIZE - vec_size; d += vec_size) {
@@ -283,7 +283,7 @@ void biased_grouped_topk_kernel_impl(
     int64_t num_groups,
     int64_t topk_group,
     bool renormalize) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
 
   const int64_t num_experts_per_group = NUM_EXPERTS / num_groups;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
@@ -304,8 +304,8 @@ void biased_grouped_topk_kernel_impl(
 
       for (int64_t g = 0; g < num_groups; ++g) {
         // find the max
-        float gmax = at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+        float gmax = sgl_vec::reduce_all<float>(
+            [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); },
             scores2 + g * num_experts_per_group,
             num_experts_per_group);
 
@@ -321,8 +321,8 @@ void biased_grouped_topk_kernel_impl(
 
         // find the 2nd max
         scores2[first_max_idx] = -std::numeric_limits<float>::infinity();
-        float gmax2 = at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
+        float gmax2 = sgl_vec::reduce_all<float>(
+            [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); },
             scores2 + g * num_experts_per_group,
             num_experts_per_group);
         // restore scores for choice

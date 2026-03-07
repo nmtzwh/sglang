@@ -6,7 +6,7 @@ namespace {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ y, const scalar_t* __restrict__ x, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
   const bool is_padding = (x == nullptr);
   for (int64_t d = 0; d < size; d += Vec::size()) {
     Vec data_vec = is_padding ? Vec(0.f) : Vec::loadu(x + d);
@@ -175,8 +175,8 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
       vc[col * 2 + 1] = _mm512_dpbf16_ps(vc[col * 2 + 1], va3, vb[3 * COLS + col]);
     };
 
-    using fVec = at::vec::Vectorized<float>;
-    using bVec = at::vec::Vectorized<at::BFloat16>;
+    using fVec = sgl_vec::Vectorized<float>;
+    using bVec = sgl_vec::Vectorized<at::BFloat16>;
     const fVec one = fVec(1.f);
     auto storec = [&](auto i, int64_t m) {
       constexpr int col = i;
@@ -197,6 +197,109 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
       Unroll<COLS>{}(compute);
       // step 3.c : store c at current time step
       Unroll<COLS>{}(storec, m);
+    }
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic causal conv1d kernel
+template <int K, int BLOCK_N, bool has_bias, bool has_silu>
+struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      const at::BFloat16* __restrict__ bias,
+      const at::BFloat16* __restrict__ conv_states,
+      bool has_initial_state,
+      int64_t M,
+      int64_t lda,
+      bool is_first_token) {
+    static_assert(K == 4, "Only K=4 is supported");
+    const uint64_t vl_f32 = svcntw();
+    constexpr int ldb_packed = block_size_n() * K;  // stride for packed weight
+
+    // Weight is packed as [K/2, BLOCK_N, 2] (VNNI format)
+    // We load it as fp32 pairs: each fp32 has 2 bf16 values
+    // For SVE we'll depack and use FMA
+
+    // Load weights once (they don't change across M)
+    // Weight layout: B[col * ldb_packed + row * 32] for K=4, each 32 element block
+    // It's [K/2, block_size_n, 2] = 2 iterations of 32 bf16 = 4 rows of 32 bf16
+
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+
+        // Initialize accumulator with bias or zero
+        svfloat32_t vacc;
+        if (has_bias) {
+          // Load bf16 bias and convert to fp32
+          svbool_t pg16 = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
+          svbfloat16_t vb = svld1_bf16(pg16, reinterpret_cast<const bfloat16_t*>(bias + n));
+          vacc = svcvt_f32_bf16_x(pg, vb);
+        } else {
+          vacc = svdup_f32(0.f);
+        }
+
+        // Accumulate across K=4 time steps
+        for (int k = 0; k < K; ++k) {
+          int time_idx = m - (K - 1 - k);
+          svfloat32_t va;
+
+          if (time_idx < 0 && is_first_token) {
+            // Load from conv_states if available
+            if (has_initial_state && conv_states != nullptr) {
+              svbool_t pg16a = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
+              svbfloat16_t vstate =
+                  svld1_bf16(pg16a, reinterpret_cast<const bfloat16_t*>(conv_states + (time_idx + K - 1) * lda + n));
+              va = svcvt_f32_bf16_x(pg, vstate);
+            } else {
+              va = svdup_f32(0.f);
+            }
+          } else {
+            svbool_t pg16a = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
+            svbfloat16_t vinput = svld1_bf16(pg16a, reinterpret_cast<const bfloat16_t*>(A + time_idx * lda + n));
+            va = svcvt_f32_bf16_x(pg, vinput);
+          }
+
+          // Load weight for this k and n
+          // Weight is packed as VNNI: [K/2, BLOCK_N, 2]
+          // For scalar access: weight[n, k] where N is outer dimension
+          // In the packed format, we need to extract individual k values
+          // Simpler: load from the original interleaved format
+          int k2 = k >> 1;
+          int k_ofs = k & 1;
+          // B is at base + col * ldb_packed (for block_size_n blocks)
+          // Within a block: [k/2][n][2], so offset = k2 * block_size_n() * 2 + n_local * 2 + k_ofs
+          int64_t n_block = n / block_size_n();
+          int64_t n_local = n % block_size_n();
+          // Scalar weight load for correctness
+          float w_vals[16];  // max VL elements
+          for (uint64_t i = 0; i < vl_f32 && (n + i) < (uint64_t)BLOCK_N; ++i) {
+            int64_t nl = (n + i) % block_size_n();
+            int64_t nb = (n + i) / block_size_n();
+            const at::BFloat16* w_base = B + nb * ldb_packed;
+            w_vals[i] = static_cast<float>(w_base[k2 * block_size_n() * 2 + nl * 2 + k_ofs]);
+          }
+          svfloat32_t vw = svld1_f32(pg, w_vals);
+
+          vacc = svmla_f32_x(pg, vacc, va, vw);
+        }
+
+        // Apply SiLU if needed
+        if (has_silu) {
+          svfloat32_t vneg = svneg_f32_x(pg, vacc);
+          svfloat32_t vexp = sve_fexp_u20(pg, vneg);
+          svfloat32_t vdenom = svadd_f32_x(pg, svdup_f32(1.f), vexp);
+          vacc = svdiv_f32_x(pg, vacc, vdenom);
+        }
+
+        // Convert to bf16 and store
+        svbfloat16_t vout = svcvt_bf16_f32_x(pg, vacc);
+        svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * lda + n), vout);
+      }
     }
   }
 };

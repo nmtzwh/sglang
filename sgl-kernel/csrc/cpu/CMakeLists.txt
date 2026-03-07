@@ -84,12 +84,46 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
+# Platform-specific compile options
 add_compile_options(
     -O3
     -Wno-unknown-pragmas
-    -march=native
     -fopenmp
 )
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    # Detect SVE + BF16 support on aarch64
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-march=armv8.6-a+sve+bf16")
+    check_cxx_source_compiles("
+        #include <arm_sve.h>
+        int main() {
+            svfloat32_t a = svdup_f32(1.0f);
+            svbfloat16_t b = svdup_bf16(0);
+            (void)a; (void)b;
+            return 0;
+        }
+    " HAS_SVE_BF16)
+    unset(CMAKE_REQUIRED_FLAGS)
+
+    if(HAS_SVE_BF16)
+        message(STATUS "Enabling SVE + BF16 support for aarch64")
+        add_compile_definitions(CPU_CAPABILITY_SVE)
+        if("$ENV{SGLANG_SVE512_VEC}" STREQUAL "1")
+            message(STATUS "Enabling fixed-length SVE-512 Vectorized fallback")
+            add_compile_definitions(SGLANG_SVE512_VEC)
+            add_compile_options(-msve-vector-bits=512)
+        endif()
+        # Use -march=native on real hardware; fall back to explicit features otherwise
+        add_compile_options(-march=native)
+    else()
+        message(STATUS "SVE + BF16 not available, using NEON fallback")
+        add_compile_options(-march=native)
+    endif()
+else()
+    # x86_64: use -march=native to auto-enable AVX-512, etc.
+    add_compile_options(-march=native)
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})

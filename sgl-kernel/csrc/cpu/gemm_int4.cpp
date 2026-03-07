@@ -373,7 +373,7 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
 #pragma GCC unroll 2
       for (; j < N; j += 16) {
         __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
+        __m256i y_bf16_vec = sgl_vec::cvtfp32_bf16(y_vec);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_bf16_vec);
       }
 #endif
@@ -385,7 +385,7 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
 #pragma GCC unroll 2
       for (; j < N; j += 16) {
         __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
+        __m256i y_fp16_vec = sgl_vec::cvtfp32_fp16(y_vec);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_fp16_vec);
       }
 #endif
@@ -399,7 +399,7 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
 }
 
 void fill_val_stub(int32_t* __restrict__ output, int32_t value, int64_t size) {
-  using iVec = at::vec::Vectorized<int32_t>;
+  using iVec = sgl_vec::Vectorized<int32_t>;
   constexpr int VecSize = iVec::size();
   const iVec fill_val_vec = iVec(value);
   int64_t d;
@@ -739,8 +739,8 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
 }
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {

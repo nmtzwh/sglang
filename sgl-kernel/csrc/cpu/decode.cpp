@@ -128,7 +128,7 @@ void pack_vnni(
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
+  using Vec = sgl_vec::Vectorized<scalar_t>;
   constexpr int kVecSize = Vec::size();
   const Vec data_vec = Vec(static_cast<scalar_t>(val));
   int64_t d = 0;
@@ -143,8 +143,8 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_fvec = fVec(s);
   int64_t d = 0;
@@ -162,7 +162,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
   constexpr int kVecSize = bVec::size();
   int64_t d = 0;
 #pragma GCC unroll 4
@@ -178,8 +178,8 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ s
 template <typename scalar_t, int BLOCK_N>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input) {
   static_assert(BLOCK_N % 32 == 0);
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
 
   constexpr int COLS = BLOCK_N / 16;
   auto store = [&](auto i) {
@@ -304,6 +304,49 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       C[row * ldc + col] = _mm512_reduce_add_ps(_mm512_mul_ps(vc[i], vscale));
     };
     Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic Q@K^T kernel for bf16 decode attention
+template <typename index_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      float scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N;
+    const uint64_t vl_bf16 = svcnth();  // number of bf16 elements per SVE vector
+
+    // Accumulate C[m][n] = scale * sum_k(A[m][k] * B[ind[n]][k])
+    for (int m = 0; m < ROWS; ++m) {
+      for (int n = 0; n < COLS; ++n) {
+        int64_t b_idx = indices[n];
+        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
+
+        svfloat32_t vacc = svdup_f32(0.f);
+        const at::BFloat16* a_row = A + m * lda;
+        const at::BFloat16* b_row = B + b_idx * ldb;
+
+        int64_t k = 0;
+        for (; k < K; k += vl_bf16) {
+          svbool_t pg = svwhilelt_b16((uint32_t)k, (uint32_t)K);
+          svbfloat16_t va = svld1_bf16(pg, reinterpret_cast<const bfloat16_t*>(a_row + k));
+          svbfloat16_t vb = svld1_bf16(pg, reinterpret_cast<const bfloat16_t*>(b_row + k));
+          vacc = svbfdot_f32(vacc, va, vb);
+        }
+        C[m * ldc + n] = svaddv_f32(svptrue_b32(), vacc) * scale;
+      }
+    }
   }
 };
 #endif
@@ -526,6 +569,50 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       _mm512_storeu_ps(C + row * ldc + col * 16, vc[i]);
     };
     Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#if defined(CPU_CAPABILITY_SVE)
+// SVE VL-agnostic Attn@V kernel for bf16 decode attention
+template <typename index_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const float* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      const float* __restrict__ scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
+    constexpr int ROWS = BLOCK_M;
+    const uint64_t vl_f32 = svcntw();
+
+    // C[m][n] = scale[m]*C[m][n] + sum_k(A[m][k] * B[ind[k]][n])
+    for (int m = 0; m < ROWS; ++m) {
+      float s = scale[m];
+      // Process N in SVE-width chunks
+      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+        svfloat32_t vc = svld1_f32(pg, C + m * ldc + n);
+        vc = svmul_f32_x(pg, vc, svdup_f32(s));
+
+        for (int64_t k = 0; k < K; ++k) {
+          int64_t b_idx = indices[k];
+          TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
+          float a_val = A[m * lda + k];
+          // Load B[b_idx][n..n+vl] as bf16 -> fp32
+          svbfloat16_t vb_bf16 = svld1_bf16(
+              svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<const bfloat16_t*>(B + b_idx * ldb + n));
+          svfloat32_t vb = sve_cvt_bf16_to_fp32_low(vb_bf16);
+          vc = svmla_f32_x(pg, vc, svdup_f32(a_val), vb);
+        }
+        svst1_f32(pg, C + m * ldc + n, vc);
+      }
+    }
   }
 };
 #endif
@@ -987,7 +1074,7 @@ void decode_accumulate_kv_splits(
     int64_t num_kv_splits,
     int64_t l_stride1,
     int64_t l_stride2) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
 
   // parallel on [batches, num_heads]
   at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
@@ -1011,7 +1098,7 @@ void decode_accumulate_kv_splits(
         float m_delta = std::exp(m_prime - m_i);
         float e_logic = std::exp(tlogic - m_i);
         if (kv_id != 0) {
-          at::vec::map2<float>(
+          sgl_vec::map2<float>(
               [m_delta, e_logic](Vec x, Vec y) { return x * Vec(m_delta) + y * Vec(e_logic); },
               acc,
               acc,
@@ -1054,7 +1141,7 @@ void decode_attention_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
 
   // strides
   const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
@@ -1114,7 +1201,7 @@ void decode_attention_kernel_impl(
 
         // TODO: `tanh` from torch uses sleef u10, going to be slow
         if (has_logit_cap) {
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
               s_i,
               s_i,
@@ -1122,18 +1209,18 @@ void decode_attention_kernel_impl(
         }
 
         // m_i: max value per row
-        float m_i = at::vec::reduce_all<float>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i, n_size);
+        float m_i = sgl_vec::reduce_all<float>([](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); }, s_i, n_size);
         m_i = std::max(m_i, m_prime);
 
         // m_delta <- exp(m' - m_i)
         float m_delta = std::exp(m_prime - m_i);
 
         // s_delta <- exp(s_i - m_i)
-        at::vec::map<float>([m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
+        sgl_vec::map<float>([m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
 
         // s' <- s' * m_delta + sum(s_delta)
         s_prime *= m_delta;
-        s_prime += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
+        s_prime += sgl_vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
 
         m_prime = m_i;
 
@@ -1156,7 +1243,7 @@ void decode_attention_kernel_impl(
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
         float s = 1 / s_prime;
-        at::vec::map<float>([s](Vec out) { return out * Vec(s); }, v_prime, v_prime, head_size_v);
+        sgl_vec::map<float>([s](Vec out) { return out * Vec(s); }, v_prime, v_prime, head_size_v);
 
         v_prime[head_size_v] = m_prime + std::log(s_prime);
       }
@@ -1198,7 +1285,7 @@ void decode_attention_mla_kernel_impl(
     int64_t max_context_len,
     int64_t max_total_num_tokens,
     int64_t buffer_size_per_thread) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
 
   // block length for heads
   const int64_t BLOCK_H = batches == 1 ? 6 : (batches > 16 ? 22 : 11);
@@ -1294,30 +1381,30 @@ void decode_attention_mla_kernel_impl(
         const Vec scale_vec = Vec(sm_scale);
         for (int64_t h = 0; h < h_size; ++h) {
           // s_i <- s_i * scale
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [scale_vec](Vec x) { return x * scale_vec; }, s_i + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
 
           // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
+          float m_i = sgl_vec::reduce_all<float>(
+              [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
           m_i = std::max(m_i, m_prime[h]);
 
           // m_delta <- exp(m' - m_i)
           m_delta[h] = std::exp(m_prime[h] - m_i);
 
           // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[h] *= m_delta[h];
-          s_prime[h] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
+          s_prime[h] += sgl_vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
 
           m_prime[h] = m_i;
 
           // v' <- v' * m_delta
           float scale_m = m_delta[h];
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [scale_m](Vec x) { return x * Vec(scale_m); },
               v_prime + h * l_stride1,
               v_prime + h * l_stride1,
@@ -1346,7 +1433,7 @@ void decode_attention_mla_kernel_impl(
       if (kv_end > kv_start) {
         for (int64_t h = 0; h < h_size; ++h) {
           float s = 1 / s_prime[h];
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
@@ -1389,7 +1476,7 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-  using Vec = at::vec::Vectorized<float>;
+  using Vec = sgl_vec::Vectorized<float>;
 
   // block length for heads
   // we parallel on [batches, divup(num_heads, BLOCK_H), num_kv_splits]
@@ -1467,7 +1554,7 @@ void decode_attention_grouped_kernel_impl(
             /* mtt */ max_total_num_tokens);
 
         if (has_logit_cap) {
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
               s_i,
               s_i,
@@ -1477,20 +1564,20 @@ void decode_attention_grouped_kernel_impl(
         // update the sm_scale coefficients
         for (int64_t h = 0; h < h_size; ++h) {
           // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
+          float m_i = sgl_vec::reduce_all<float>(
+              [](Vec& x, Vec& y) { return sgl_vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
           m_i = std::max(m_i, m_prime[h]);
 
           // m_delta <- exp(m' - m_i)
           m_delta[h] = std::exp(m_prime[h] - m_i);
 
           // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[h] *= m_delta[h];
-          s_prime[h] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
+          s_prime[h] += sgl_vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
 
           m_prime[h] = m_i;
         }
@@ -1515,7 +1602,7 @@ void decode_attention_grouped_kernel_impl(
       if (kv_end > kv_start) {
         for (int64_t h = 0; h < h_size; ++h) {
           float s = 1 / s_prime[h];
-          at::vec::map<float>(
+          sgl_vec::map<float>(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
