@@ -80,20 +80,27 @@ qemu-aarch64 -cpu max,sve512=on ./build/test_sve_kernels
 SVE vector length: 512 bits (16 x fp32)
 
 [TEST] bf16 <-> fp32 conversion roundtrip
-[TEST] SVE horizontal reduce (svaddv, svmaxv)
-[TEST] SVE bfdot (bf16 dot product)
-[TEST] Portable GEMM kernel (bf16 matmul)
-[TEST] VNNI pack format correctness
-[TEST] SVE fast exponential approximation
-[TEST] SVE predicated tail handling
-[TEST] General bf16 GEMM (non-identity)
-[TEST] SVE SiLU activation
-[TEST] VL-agnostic loop pattern
+...
+[TEST] GEMM with accumulate (add_C mode)
+
+=== Results: 11 passed, 0 failed ===
+```
+
+```
+=== High-Level SVE Algorithm Functional Tests ===
+SVE vector length: 512 bits (16 x fp32)
+
+[TEST] RMSNorm and GemmaRMSNorm
+[TEST] SiLUAndMul and GeLUAndMul
+[TEST] Rotary Embedding (RoPE)
+[TEST] TopK Softmax (kernel logic)
 
 === Results: XX passed, 0 failed ===
 ```
 
 ## Test Coverage
+
+### Low-Level Primitives (`test_sve_kernels`)
 
 | Test | What it validates |
 |---|---|
