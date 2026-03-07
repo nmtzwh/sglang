@@ -264,19 +264,14 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
-        else:
-            return self.forward_native(
-                positions, query, key, offsets, fused_set_kv_buffer_arg
-            )
+        return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
 
     def forward_cuda(
         self,

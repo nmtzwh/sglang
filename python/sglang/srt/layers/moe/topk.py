@@ -894,7 +894,7 @@ def biased_grouped_topk_cpu(
     )
 
 
-if _is_cpu and _is_cpu_amx_available:
+if _is_cpu:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu

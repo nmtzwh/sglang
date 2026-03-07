@@ -267,19 +267,16 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _is_cpu_amx_available:
-            if residual is not None:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
-                    x, residual, self.weight.data, self.variance_epsilon
-                )
-                return x, residual
-            return torch.ops.sgl_kernel.rmsnorm_cpu(
-                x, self.weight.data, self.variance_epsilon
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
+                x, residual, self.weight.data, self.variance_epsilon
             )
-        else:
-            return self.forward_native(x, residual, post_residual_addition)
+            return x, residual
+        return torch.ops.sgl_kernel.rmsnorm_cpu(
+            x, self.weight.data, self.variance_epsilon
+        )
 
     def forward_xpu(
         self,
@@ -484,18 +481,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _is_cpu_amx_available:
-            if residual is not None:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
-                    x, residual, self.weight.data, self.variance_epsilon
-                )
-                return x, residual
-            return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
-                x, self.weight.data, self.variance_epsilon
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
+                x, residual, self.weight.data, self.variance_epsilon
             )
-        return self.forward_native(x, residual, post_residual_addition)
+            return x, residual
+        return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+            x, self.weight.data, self.variance_epsilon
+        )
 
     def forward_npu(
         self,
