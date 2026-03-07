@@ -1,115 +1,61 @@
-# SVE Support for `extend_attention` and `flash_linear_attention`
+# High-Level SVE Op Testing Plan
 
-## Problem
+## Goal
 
-Both `extend.cpp` and `fla.cpp` call `at::native::cpublas::brgemm()` **unconditionally** (not guarded by `can_use_brgemm()`). Since `brgemm` is an x86 AMX instruction, these kernels will **fail at runtime** on aarch64.
+Add standalone SVE functional tests for the core algorithm patterns used by the sgl-kernel high-level CPU ops, following the same cross-compile + QEMU strategy as the existing [test_sve_kernels.cpp](file:///home/tom/workspace/sglang/sgl-kernel/csrc/cpu/tests/test_sve_kernels.cpp).
 
-> [!CAUTION]
-> Unlike `gemm.cpp`/`moe.cpp` where `tinygemm_kernel` checks `can_use_brgemm()` and falls back to SVE micro-kernels, `extend.cpp` and `fla.cpp` call `brgemm` directly. This is the highest-priority fix.
-
-## Analysis Summary
-
-### `extend.cpp` — Extend Attention
-- **4 `brgemm` calls** — Q@K^T and S@V for both prefix and extend stages
-- Uses `pack_vnni`/`pack_vnni2` from `vec_pack.h` — scalar `#else` fallback exists ✅
-- Uses `flash_attn_softmax` — SVE already ported ✅
-- Uses `fill_stub`/`copy_stub` via PyTorch `Vectorized<>` — works on aarch64 ✅
-
-### `fla.cpp` — Flash Linear Attention (Gated Delta Rule)
-
-#### `chunk_gated_delta_rule_kernel_impl` (lines 30-795)
-- **8 `brgemm` calls** — Multiple GEMM operations in the chunked delta rule algorithm
-- Uses `pack_vnni`/`pack_vnni2` — scalar fallback exists ✅
-- Uses `at::native::utils::transpose` — architecture-independent ✅
-- Uses PyTorch `Vectorized<>` for elementwise ops — works on aarch64 ✅
-- Uses `vec_reduce_sum` — SVE already ported ✅
-
-#### `fused_sigmoid_gating_delta_rule_update_kernel_impl` (lines 817-974)
-- **No `brgemm` calls** — purely `Vectorized<>` based ✅
-- Uses `vec_reduce_sum` — SVE already ported ✅
-- **Already works on aarch64** ✅
-
-#### `fused_gdn_gating_kernel_impl` (lines 976-1022)
-- **No `brgemm` calls** — purely `Vectorized<>` + scalar ✅
-- **Already works on aarch64** ✅
+> [!IMPORTANT]
+> The actual kernel functions (e.g., `rmsnorm_cpu`, `silu_and_mul_cpu`) depend on PyTorch ATen and cannot be compiled standalone.
+> Instead, we reimplement the **core vectorized algorithm** from each kernel using raw SVE intrinsics, and compare against a scalar reference.
 
 ## Proposed Changes
 
-### 1. Replace `brgemm` with architecture-aware GEMM wrapper
+### Testing Component
 
-> [!IMPORTANT]
-> We need a wrapper that dispatches to `brgemm` on x86 and to an SVE-based GEMM on aarch64. The wrapper handles both bf16 input→fp32 accumulation and bf16 input→bf16 output cases.
+#### [NEW] [test_sve_highlevel_ops.cpp](file:///home/tom/workspace/sglang/sgl-kernel/csrc/cpu/tests/test_sve_highlevel_ops.cpp)
 
-#### [MODIFY] [gemm.h](file:///wsl.localhost/Ubuntu/home/tom/workspace/sglang/sgl-kernel/csrc/cpu/gemm.h)
+Standalone C++ tests covering the **algorithm patterns** from these kernels:
 
-Add a portable `gemm_kernel()` wrapper function that:
-- On x86: calls `at::native::cpublas::brgemm()` directly (existing fast path)
-- On aarch64/SVE: calls our SVE `tinygemm_kernel_nn` micro-kernel with tile-blocking
+| Test | Kernel Source | Algorithm Tested |
+|------|-------------|-----------------|
+| `test_rmsnorm` | `norm.cpp` | VL-agnostic variance+normalize loop |
+| `test_fused_add_rmsnorm` | `norm.cpp` | Residual add + RMSNorm (fused) |
+| `test_gemma_rmsnorm` | `norm.cpp` | RMSNorm with `weight + 1` (Gemma variant) |
+| `test_silu_and_mul` | `activation.cpp` | Split input, SiLU(x) * y |
+| `test_gelu_tanh_and_mul` | `activation.cpp` | Split input, GELU_tanh(x) * y |
+| `test_gelu_and_mul` | `activation.cpp` | Split input, GELU(x) * y |
+| `test_rotary_embedding` | `rope.cpp` | cos/sin rotation of query/key heads |
+| `test_topk_softmax` | `topk.cpp` | Softmax + top-K selection |
+| `test_fused_rmsnorm_gated` | `norm.cpp` | RMSNorm(x) * SiLU(gate) |
 
-```cpp
-// Portable GEMM wrapper — dispatches to brgemm (x86) or SVE tinygemm (aarch64)
-template <typename scalar_t>
-void gemm_kernel(
-    int M, int N, int K,
-    int lda, int ldb, int ldc,
-    bool add_C,
-    const scalar_t* A,    // [M, K] in VNNI format for brgemm, raw for SVE
-    const scalar_t* B,    // [K/2, N, 2] VNNI packed
-    float* C);            // [M, N] fp32 output
-```
+Each test: (1) generates deterministic input data, (2) runs the SVE-vectorized kernel implementation, (3) compares against a scalar reference, (4) reports pass/fail.
 
----
+#### [MODIFY] [CMakeLists.txt](file:///home/tom/workspace/sglang/sgl-kernel/csrc/cpu/tests/CMakeLists.txt)
 
-#### [MODIFY] [extend.cpp](file:///wsl.localhost/Ubuntu/home/tom/workspace/sglang/sgl-kernel/csrc/cpu/extend.cpp)
+Add `test_sve_highlevel_ops` as a second test executable.
 
-Replace 4 `at::native::cpublas::brgemm()` calls with `gemm_kernel()` wrapper. Also replace the `brgemm_release()` call with a conditional guard.
+#### [NEW] [SVE_TESTING.md](file:///home/tom/workspace/sglang/sgl-kernel/csrc/cpu/tests/SVE_TESTING.md) (modify)
 
----
+Add section documenting the high-level op tests.
 
-#### [MODIFY] [fla.cpp](file:///wsl.localhost/Ubuntu/home/tom/workspace/sglang/sgl-kernel/csrc/cpu/mamba/fla.cpp)
+## Verification Plan
 
-Replace 8 `at::native::cpublas::brgemm()` calls with `gemm_kernel()` wrapper.
+### Automated Tests
 
----
+Build and run with QEMU at SVE-512, SVE-256, and SVE-128:
 
-### 2. SVE fast path for `vec_pack.h`
-
-#### [MODIFY] [vec_pack.h](file:///wsl.localhost/Ubuntu/home/tom/workspace/sglang/sgl-kernel/csrc/cpu/vec_pack.h)
-
-Add `#elif defined(CPU_CAPABILITY_SVE)` path for `pack_vnni` and `pack_vnni2`. The scalar fallback works but is slow; an SVE path using `svld1`/`svst1` with stride-based gather/scatter will improve packing throughput.
-
-## PyTorch ATen SVE-512 Vector Fallback
-
-The user requested a compiler-enabled fallback path for PyTorch's `at::vec` API to fixed-length SVE-512 vectors, as SVE-512 is poorly supported natively.
-
-### Architecture
-1. **Toggle Switch**: We will add a CMake option `SGLANG_SVE512_VEC` to enable/disable the SVE-512 `Vectorized` fallback. When enabled, it will set `-DSGLANG_SVE512_VEC` and `-msve-vector-bits=512` during compilation.
-2. **Namespace Alias**: We will replace all hardcoded occurrences of `at::vec` with `sgl_vec` across the codebase.
-3. **Dispatch Header**: In `vec.h`, we will add logic:
-   ```cpp
-   #if defined(CPU_CAPABILITY_SVE) && defined(SGLANG_SVE512_VEC)
-   #include "vec_sve512.h"
-   namespace sgl_vec = sgl::vec;
-   #else
-   namespace sgl_vec = at::vec;
-   #endif
-   ```
-4. **SVE-512 Implementation (`vec_sve512.h`)**: We will implement `sgl::vec::Vectorized<T>` for `float`, `at::BFloat16`, and `at::Half`. These will use ACLE fixed-length `__attribute__((arm_sve_vector_bits(512)))` types implicitly or raw `float arr[16]` loaded via `svld1_f32(svptrue_b32(), arr)`.
-
-### Verification Plan
-- Compile the SGLang CPU core with SGLANG_SVE512_VEC enabled.
-- Verify our test suite works seamlessly using the fallback vector types.
-
-### Build Test
 ```bash
-# Cross-compile for aarch64
-cmake -DCMAKE_TOOLCHAIN_FILE=... -DCMAKE_SYSTEM_PROCESSOR=aarch64 ..
-make -j
+cd sgl-kernel/csrc/cpu/tests
+
+# Build
+aarch64-linux-gnu-g++ -O2 -march=armv8.6-a+sve+bf16 -static \
+  -o test_sve_highlevel_ops test_sve_highlevel_ops.cpp
+
+# Run at all VLs
+for vl in 128 256 512; do
+  echo "--- SVE-${vl} ---"
+  qemu-aarch64 -cpu max,sve${vl}=on ./test_sve_highlevel_ops
+done
 ```
 
-### Functional Test  
-```bash
-# QEMU user-mode emulation
-qemu-aarch64 -cpu max,sve512=on ./test_extend_attention
-qemu-aarch64 -cpu max,sve512=on ./test_fla
-```
+All tests should pass at every vector length.
