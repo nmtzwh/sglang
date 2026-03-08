@@ -316,7 +316,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
         svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
         svfloat32_t vf = svld1_f32(pg, acc[m] + n);
-        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vf);
+        svbfloat16_t vbf = sve_f32_to_bf16(pg, vf);
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
       }
     }

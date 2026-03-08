@@ -184,7 +184,7 @@ struct Vectorized<at::BFloat16> {
 
   Vectorized() {}
   Vectorized(fixed_svbfloat16_t v) : vec_(v) {}
-  Vectorized(at::BFloat16 v) : vec_(svdup_bf16(v.x)) {}
+  Vectorized(at::BFloat16 v) : vec_(svreinterpret_bf16_u16(svdup_u16(v.x))) {}
 
   operator fixed_svbfloat16_t() const {
     return vec_;
@@ -235,7 +235,7 @@ template <>
 inline Vectorized<at::BFloat16>
 convert_from_float<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
   // float to bf16 natively
-  return svcvt_bf16_f32_x(svptrue_b32(), a.vec_);  // Simplified: we lose b
+  return sve_f32_to_bf16(svptrue_b32(), a.vec_);  // Simplified: we lose b
 }
 
 // Vectorized<T> array conversions

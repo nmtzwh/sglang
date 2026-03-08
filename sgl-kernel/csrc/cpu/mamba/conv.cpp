@@ -45,6 +45,7 @@ void inline update_conv_state(
 //
 // lda : leading dimension of `input` and `out`
 //
+
 template <typename scalar_t, int K, int BLOCK_N, bool has_bias, bool has_silu>
 struct tinygemm_kernel {
   static inline void apply(
@@ -238,7 +239,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
           // Load bf16 bias and convert to fp32
           svbool_t pg16 = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
           svbfloat16_t vb = svld1_bf16(pg16, reinterpret_cast<const bfloat16_t*>(bias + n));
-          vacc = svcvt_f32_bf16_x(pg, vb);
+          vacc = sve_bf16_to_f32(pg, vb);
         } else {
           vacc = svdup_f32(0.f);
         }
@@ -254,14 +255,14 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
               svbool_t pg16a = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
               svbfloat16_t vstate =
                   svld1_bf16(pg16a, reinterpret_cast<const bfloat16_t*>(conv_states + (time_idx + K - 1) * lda + n));
-              va = svcvt_f32_bf16_x(pg, vstate);
+              va = sve_bf16_to_f32(pg, vstate);
             } else {
               va = svdup_f32(0.f);
             }
           } else {
             svbool_t pg16a = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
             svbfloat16_t vinput = svld1_bf16(pg16a, reinterpret_cast<const bfloat16_t*>(A + time_idx * lda + n));
-            va = svcvt_f32_bf16_x(pg, vinput);
+            va = sve_bf16_to_f32(pg, vinput);
           }
 
           // Load weight for this k and n
@@ -297,7 +298,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
         }
 
         // Convert to bf16 and store
-        svbfloat16_t vout = svcvt_bf16_f32_x(pg, vacc);
+        svbfloat16_t vout = sve_f32_to_bf16(pg, vacc);
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * lda + n), vout);
       }
     }
@@ -306,7 +307,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL(K, NB_SIZE)                                                   \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                          \
+  (tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                          \
       input + bs * seqlen * dim + mb_start * dim + nb_start,                                 \
       weight + nb_start * width,                                                             \
       out + bs * seqlen * dim + mb_start * dim + nb_start,                                   \
@@ -315,7 +316,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
       has_initial_states_value,                                                              \
       mb_size,                                                                               \
       dim,                                                                                   \
-      mb_start == 0);
+      mb_start == 0))
 
 template <typename scalar_t>
 void causal_conv1d_fwd_kernel_impl(
@@ -387,7 +388,7 @@ void causal_conv1d_fwd_kernel_impl(
 }
 
 #define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                   \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
+  (tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
       input + batch_offset * dim + mb_start * dim + nb_start,       \
       weight + nb_start * width,                                    \
       out + batch_offset * dim + mb_start * dim + nb_start,         \
@@ -396,7 +397,7 @@ void causal_conv1d_fwd_kernel_impl(
       false,                                                        \
       mb_size,                                                      \
       dim,                                                          \
-      mb_start == 0);
+      mb_start == 0))
 
 // TODO: add `has_initial_state` support for varlen kernel
 template <typename scalar_t>

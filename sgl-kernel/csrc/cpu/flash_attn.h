@@ -290,7 +290,7 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
         vs = sve_fexp_u20(pg, svsub_f32_x(pg, vs, vm_i));
         vsum = svadd_f32_m(pg, vsum, vs);
         // Convert to bf16 and store
-        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vs);
+        svbfloat16_t vbf = sve_f32_to_bf16(pg, vs);
         svst1_bf16(
             svwhilelt_b16((uint32_t)n, (uint32_t)n_size),
             reinterpret_cast<bfloat16_t*>(s_delta2 + m * BLOCK_N + n),
@@ -310,7 +310,7 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
           svst1_bf16(
               svwhilelt_b16((uint32_t)n, (uint32_t)padded_n_size),
               reinterpret_cast<bfloat16_t*>(s_delta2 + m * BLOCK_N + n),
-              svdup_bf16(0));
+              svreinterpret_bf16_u16(svdup_u16(0)));
         }
       }
 

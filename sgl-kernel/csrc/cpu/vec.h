@@ -4,15 +4,15 @@
 #define CPU_CAPABILITY_AVX512
 #endif
 
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#include <ATen/cpu/vec/functional.h>
+#include <ATen/cpu/vec/vec.h>
+
+#if defined(SGLANG_WITH_SVE) || (defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16))
 #ifndef CPU_CAPABILITY_SVE
 #define CPU_CAPABILITY_SVE
 #endif
 #include <arm_sve.h>
 #endif
-
-#include <ATen/cpu/vec/functional.h>
-#include <ATen/cpu/vec/vec.h>
 
 #include "vec_sve512.h"
 
@@ -174,6 +174,22 @@ inline uint64_t sve_float_count() {
 // ============================================================
 // SVE BF16 <-> FP32 conversion (VL-agnostic)
 // ============================================================
+
+// bf16 vector -> fp32 vector (widen lower half)
+inline svfloat32_t sve_bf16_to_f32(svbool_t pg, svbfloat16_t vb) {
+  svuint16_t vu16 = svreinterpret_u16(vb);
+  svuint32_t vu32 = svunpklo_u32(vu16);
+  vu32 = svlsl_n_u32_x(pg, vu32, 16);
+  return svreinterpret_f32(vu32);
+}
+
+// fp32 vector -> bf16 vector (truncate, store into lower half)
+inline svbfloat16_t sve_f32_to_bf16(svbool_t pg, svfloat32_t vf) {
+  svuint32_t vu32 = svreinterpret_u32(vf);
+  svuint16_t vu16_wide = svreinterpret_u16(svlsr_n_u32_x(pg, vu32, 16));
+  svuint16_t vu16 = svuzp1_u16(vu16_wide, svdup_u16(0));
+  return svreinterpret_bf16(vu16);
+}
 
 // Convert bf16 to fp32 by shifting left 16 bits
 // Input: N bf16 values loaded as uint16, output: N fp32 values

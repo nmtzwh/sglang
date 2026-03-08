@@ -74,6 +74,7 @@ else()
 endif()
 
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+list(FILTER SOURCES EXCLUDE REGEX "tests/.*")
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
@@ -99,7 +100,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
         #include <arm_sve.h>
         int main() {
             svfloat32_t a = svdup_f32(1.0f);
-            svbfloat16_t b = svdup_bf16(0);
+            svbfloat16_t b = svreinterpret_bf16_u16(svdup_u16(0));
             (void)a; (void)b;
             return 0;
         }
@@ -108,14 +109,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 
     if(HAS_SVE_BF16)
         message(STATUS "Enabling SVE + BF16 support for aarch64")
-        add_compile_definitions(CPU_CAPABILITY_SVE)
+        add_compile_definitions(SGLANG_WITH_SVE)
         if("$ENV{SGLANG_SVE512_VEC}" STREQUAL "1")
             message(STATUS "Enabling fixed-length SVE-512 Vectorized fallback")
             add_compile_definitions(SGLANG_SVE512_VEC)
             add_compile_options(-msve-vector-bits=512)
         endif()
-        # Use -march=native on real hardware; fall back to explicit features otherwise
-        add_compile_options(-march=native)
+        # Use explicit features to avoid missing fp16 on some native detections
+        add_compile_options(-march=armv8.6-a+sve2+bf16+fp16)
     else()
         message(STATUS "SVE + BF16 not available, using NEON fallback")
         add_compile_options(-march=native)

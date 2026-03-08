@@ -280,7 +280,8 @@ void test_activations() {
 
   // --- GeLUAndMul (erf approximation variant) ---
   const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
-  out_bf16[0] = (bfloat16_t)bf16_t(0.0f).val;  // clear
+  uint16_t zero_val = bf16_t(0.0f).val;
+  std::memcpy(&out_bf16[0], &zero_val, 2);  // clear
   for (int i = 0; i < dim; i++) {
     float x = r_in[i];
     float y = r_in[dim + i];

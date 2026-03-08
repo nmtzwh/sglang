@@ -434,7 +434,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
         // mul
         svfloat32_t vresult = svmul_f32_x(pg, vsilu, vy);
         // convert to bf16 and store
-        svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vresult);
+        svbfloat16_t vbf = sve_f32_to_bf16(pg, vresult);
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
       }
     }

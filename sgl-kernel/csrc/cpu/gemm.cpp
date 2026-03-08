@@ -311,7 +311,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
         svbool_t pg32 = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
         svfloat32_t vf = svld1_f32(pg32, acc[m] + n);
         // Convert fp32 to bf16 and store
-        svbfloat16_t vbf = svcvt_bf16_f32_x(pg32, vf);
+        svbfloat16_t vbf = sve_f32_to_bf16(pg32, vf);
         // Store low half of bf16 vector (matches the fp32 element count)
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
       }

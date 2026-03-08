@@ -392,7 +392,7 @@ inline void gemm_kernel_portable_bf16out(
     for (int64_t n = 0; n < N; n += vl_f32) {
       svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
       svfloat32_t vf = svld1_f32(pg, C + m * ldc + n);
-      svbfloat16_t vbf = svcvt_bf16_f32_x(pg, vf);
+      svbfloat16_t vbf = sve_f32_to_bf16(pg, vf);
       svst1_bf16(
           svwhilelt_b16((uint32_t)n, (uint32_t)N), reinterpret_cast<bfloat16_t*>(C_bf16 + m * ldc_bf16 + n), vbf);
     }
