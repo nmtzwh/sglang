@@ -61,6 +61,10 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
+# ---- Debug instrumentation (debug/qwen3-layer-print branch only) ----------
+from sglang.srt.models.debug_utils import dbg, dbg_sep  # noqa: E402
+_DBG_FWD_COUNT = 0  # global forward-pass counter
+
 
 import triton
 import triton.language as tl
@@ -417,10 +421,14 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        _layer_tag: str = "LinAttn",
     ):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        dbg(f"{_layer_tag}.linear_attn.input", hidden_states)
+        dbg(f"{_layer_tag}.linear_attn.proj_qkvz", projected_states_qkvz)
+        dbg(f"{_layer_tag}.linear_attn.proj_ba", projected_states_ba)
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
@@ -450,12 +458,19 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        dbg(f"{_layer_tag}.linear_attn.mixed_qkv", mixed_qkv)
+        dbg(f"{_layer_tag}.linear_attn.z", z)
+        dbg(f"{_layer_tag}.linear_attn.b", b)
+        dbg(f"{_layer_tag}.linear_attn.a", a)
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
         )
+        dbg(f"{_layer_tag}.linear_attn.core_attn_out", core_attn_out)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -473,6 +488,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
+        dbg(f"{_layer_tag}.linear_attn.out_proj", output)
         return output
 
 
@@ -541,7 +557,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
+        _tag = f"L{self.layer_id:02d}[linear]"
 
+        dbg(f"{_tag}.in_hidden", hidden_states)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -550,21 +568,27 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        dbg(f"{_tag}.after_input_norm", hidden_states)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
+                _layer_tag=_tag,
             )
+        dbg(f"{_tag}.after_linear_attn", hidden_states)
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        dbg(f"{_tag}.after_post_attn_norm", hidden_states)
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        dbg(f"{_tag}.after_mlp", hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -741,8 +765,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        _layer_tag: str = "Attn",
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        dbg(f"{_layer_tag}.qkv_proj", qkv)
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -757,16 +783,23 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = self._apply_qk_norm(q, k)
+        dbg(f"{_layer_tag}.q_after_norm", q)
+        dbg(f"{_layer_tag}.k_after_norm", k)
 
         q, k = self.rotary_emb(positions, q, k)
+        dbg(f"{_layer_tag}.q_after_rope", q)
+        dbg(f"{_layer_tag}.k_after_rope", k)
 
         attn_output = self.attn(q, k, v, forward_batch)
+        dbg(f"{_layer_tag}.attn_out", attn_output)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
+            dbg(f"{_layer_tag}.attn_out_gated", attn_output)
 
         output, _ = self.o_proj(attn_output)
+        dbg(f"{_layer_tag}.o_proj", output)
         return output
 
     def forward(
@@ -778,6 +811,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs: Any,
     ):
+        _tag = f"L{self.layer_id:02d}[attn]"
+
+        dbg(f"{_tag}.in_hidden", hidden_states)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -786,22 +822,28 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        dbg(f"{_tag}.after_input_norm", hidden_states)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                _layer_tag=_tag,
             )
+        dbg(f"{_tag}.after_self_attn", hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        dbg(f"{_tag}.after_post_attn_norm", hidden_states)
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        dbg(f"{_tag}.after_mlp", hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -872,6 +914,9 @@ class Qwen3NextModel(nn.Module):
         # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        global _DBG_FWD_COUNT
+        _DBG_FWD_COUNT += 1
+        dbg_sep(f"Qwen3NextModel forward #{_DBG_FWD_COUNT}  input_ids={tuple(input_ids.shape)}")
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
@@ -880,6 +925,8 @@ class Qwen3NextModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
+
+        dbg("embed_tokens", hidden_states)
 
         residual = None
         aux_hidden_states = []
@@ -904,6 +951,9 @@ class Qwen3NextModel(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        dbg("final_norm_out", hidden_states)
+        dbg_sep(f"Qwen3NextModel forward #{_DBG_FWD_COUNT} END")
 
         if len(aux_hidden_states) == 0:
             return hidden_states
