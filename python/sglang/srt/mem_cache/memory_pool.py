@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
+    is_host_cpu_arm64,
     is_cuda,
     is_hip,
     is_npu,
@@ -76,7 +77,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_cpu_has_amx_support = cpu_has_amx_support()
+_cpu_has_amx_support = cpu_has_amx_support() or is_host_cpu_arm64()
 _is_hip = is_hip()
 
 

@@ -2,7 +2,7 @@ import logging
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class CPUQuantMethod(IntEnum):
 def amx_process_weight_after_loading(weight, is_conv=False):
     if weight.device != torch.device("cpu"):
         return weight
-    if not cpu_has_amx_support():
+    if not (cpu_has_amx_support() or is_host_cpu_arm64()):
         return weight
     if is_conv:
         return torch.ops.sgl_kernel.causal_conv1d_weight_pack(
@@ -116,8 +116,8 @@ def _amx_process_weight_after_loading(
             weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
             weight_tensor.copy_(packed_weight)
 
-    module.use_intel_amx_backend = (
-        device == torch.device("cpu") and cpu_has_amx_support()
+    module.use_intel_amx_backend = device == torch.device("cpu") and (
+        cpu_has_amx_support() or is_host_cpu_arm64()
     )
 
     if (

@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_host_cpu_arm64,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
@@ -2172,7 +2173,7 @@ class ServerArgs:
         if (
             self.attention_backend == "intel_amx"
             and self.device == "cpu"
-            and not cpu_has_amx_support()
+            and not (cpu_has_amx_support() or is_host_cpu_arm64())
         ):
             logger.warning(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."

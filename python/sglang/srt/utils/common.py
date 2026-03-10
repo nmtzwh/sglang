@@ -3228,7 +3228,7 @@ def read_system_prompt_from_file(model_name: str) -> str:
 def prepack_weight_if_needed(weight):
     if weight.device != torch.device("cpu"):
         return weight
-    if not cpu_has_amx_support():
+    if not (cpu_has_amx_support() or is_host_cpu_arm64()):
         return weight
 
     return torch.ops.sgl_kernel.convert_weight_packed(weight)
@@ -3275,8 +3275,8 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
         packed_weight.__dict__ = weight_tensor.__dict__
         setattr(module, weight_name, packed_weight)
 
-    module.use_intel_amx_backend = (
-        device == torch.device("cpu") and cpu_has_amx_support()
+    module.use_intel_amx_backend = device == torch.device("cpu") and (
+        cpu_has_amx_support() or is_host_cpu_arm64()
     )
 
     if (
