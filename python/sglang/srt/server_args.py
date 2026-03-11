@@ -596,6 +596,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    disable_cpu_weight_prepack: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -2935,6 +2936,9 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        envs.SGLANG_DISABLE_CPU_WEIGHT_PREPACK.set(
+            "1" if self.disable_cpu_weight_prepack else "0"
+        )
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -4844,6 +4848,11 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--disable-cpu-weight-prepack",
+            action="store_true",
+            help="Disable the AMX weight prepacking optimization for CPU and fall back to torch native linear.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

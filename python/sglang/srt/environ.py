@@ -320,6 +320,7 @@ class Envs:
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
+    SGLANG_DISABLE_CPU_WEIGHT_PREPACK = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
