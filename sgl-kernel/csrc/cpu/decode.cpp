@@ -1087,7 +1087,7 @@ void decode_accumulate_kv_splits(
       float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
-      float m_prime = -std::numeric_limits<scalar_t>::infinity();
+      float m_prime = -std::numeric_limits<float>::infinity();
 
       // update acc with from each kv_split
       for (int64_t kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
@@ -1110,7 +1110,8 @@ void decode_accumulate_kv_splits(
         m_prime = m_i;
       }
 
-      copy_stub<scalar_t>(output + i * head_size_v, acc, 1 / s_prime, head_size_v);
+      float inv_s = s_prime != 0.f ? 1 / s_prime : 0.f;
+      copy_stub<scalar_t>(output + i * head_size_v, acc, inv_s, head_size_v);
     }
   });
 }
@@ -1242,7 +1243,7 @@ void decode_attention_kernel_impl(
 
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
-        float s = 1 / s_prime;
+        float s = s_prime != 0.f ? 1 / s_prime : 0.f;
         sgl_vec::map<float>([s](Vec out) { return out * Vec(s); }, v_prime, v_prime, head_size_v);
 
         v_prime[head_size_v] = m_prime + std::log(s_prime);
@@ -1432,7 +1433,7 @@ void decode_attention_mla_kernel_impl(
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
         for (int64_t h = 0; h < h_size; ++h) {
-          float s = 1 / s_prime[h];
+          float s = s_prime[h] != 0.f ? 1 / s_prime[h] : 0.f;
           sgl_vec::map<float>(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
@@ -1601,7 +1602,7 @@ void decode_attention_grouped_kernel_impl(
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
         for (int64_t h = 0; h < h_size; ++h) {
-          float s = 1 / s_prime[h];
+          float s = s_prime[h] != 0.f ? 1 / s_prime[h] : 0.f;
           sgl_vec::map<float>(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
