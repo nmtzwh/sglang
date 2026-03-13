@@ -114,7 +114,7 @@ void extend_attention_kernel_impl(
       // init v', s' and m'
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), m_size);
+      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
 
       // stage 1: compute scores with prefix
       for (int n = 0; n < seq_len_prefix; n += BLOCK_N) {
@@ -241,7 +241,7 @@ void extend_attention_kernel_impl(
 
       scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
-        float s = s_prime[row] != 0.f ? 1 / s_prime[row] : 0.f;
+        float s = 1 / s_prime[row];
         copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
       }
 
