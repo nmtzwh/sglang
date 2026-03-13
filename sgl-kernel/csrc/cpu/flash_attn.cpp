@@ -114,7 +114,7 @@ void flash_attn_kernel_impl(
       // init v', s' and m'
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), m_size);
 
       int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
       for (int n = 0; n < num_keys; n += BLOCK_N) {
@@ -146,12 +146,15 @@ void flash_attn_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
-        if (causal && num_keys - n <= BLOCK_N) {
+        if (causal && n + n_size > m) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
             // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+            int start_col = std::max(last_col + 1, 0);
+            if (start_col < n_size) {
+              float* row_ptr = s_i + row * BLOCK_N;
+              fill_stub(row_ptr + start_col, -std::numeric_limits<float>::infinity(), n_size - start_col);
+            }
           }
         }
 
@@ -290,7 +293,7 @@ void flash_attn_varlen_kernel_impl(
       // init v', s' and m'
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), m_size);
 
       int seqlen_k = cu_seqlens_k[bs + 1] - cu_seqlens_k[bs];
       int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
@@ -323,12 +326,15 @@ void flash_attn_varlen_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
-        if (causal && num_keys - n <= BLOCK_N) {
+        if (causal && n + n_size > m) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
             // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+            int start_col = std::max(last_col + 1, 0);
+            if (start_col < n_size) {
+              float* row_ptr = s_i + row * BLOCK_N;
+              fill_stub(row_ptr + start_col, -std::numeric_limits<float>::infinity(), n_size - start_col);
+            }
           }
         }
 

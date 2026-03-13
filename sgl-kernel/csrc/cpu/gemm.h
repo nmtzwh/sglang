@@ -343,9 +343,8 @@ inline void gemm_kernel_portable(
         std::memcpy(&a_pair, reinterpret_cast<const char*>(A + m * lda + k * 2), sizeof(float));
         svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_pair));
 
-        // B is VNNI: [K/2, N, 2], offset = k * ldb * 2 (in bf16 units) = k * ldb (in fp32 units)
-        // But ldb is already in bf16 units for the inner dim
-        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(B) + k * N + n));
+        // B is VNNI: [K/2, ldb, 2], offset = k * ldb * 2 (in bf16 units) = k * ldb (in fp32 units)
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(B) + k * ldb + n));
         vc = svbfdot_f32(vc, va, vb);
       }
       svst1_f32(pg, C + m * ldc + n, vc);
@@ -358,8 +357,8 @@ inline void gemm_kernel_portable(
       float acc = add_C ? C[m * ldc + n] : 0.f;
       for (int k = 0; k < K; ++k) {
         float a_val = static_cast<float>(A[m * lda + k]);
-        // Decode VNNI: B[K/2, N, 2] -> element at (k, n) is at [(k/2) * N * 2 + n * 2 + (k%2)]
-        float b_val = static_cast<float>(B[(k >> 1) * N * 2 + n * 2 + (k & 1)]);
+        // Decode VNNI: B[K/2, ldb, 2] -> element at (k, n) is at [(k/2) * ldb * 2 + n * 2 + (k%2)]
+        float b_val = static_cast<float>(B[(k >> 1) * ldb * 2 + n * 2 + (k & 1)]);
         acc += a_val * b_val;
       }
       C[m * ldc + n] = acc;
