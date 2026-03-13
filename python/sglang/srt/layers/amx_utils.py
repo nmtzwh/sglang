@@ -3,7 +3,6 @@ import logging
 import torch
 
 from sglang.srt.utils import cpu_has_amx_support, is_host_cpu_arm64
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +17,14 @@ class CPUQuantMethod(IntEnum):
 
 
 def amx_process_weight_after_loading(weight, is_conv=False):
-    if is_conv:
-        return torch.ops.sgl_kernel.causal_conv1d_weight_pack(
-            weight.view(-1, weight.size(-1))
-        )
-    if envs.SGLANG_DISABLE_CPU_WEIGHT_PREPACK.get():
-        return weight
     if weight.device != torch.device("cpu"):
         return weight
     if not (cpu_has_amx_support() or is_host_cpu_arm64()):
         return weight
+    if is_conv:
+        return torch.ops.sgl_kernel.causal_conv1d_weight_pack(
+            weight.view(-1, weight.size(-1))
+        )
     else:
         return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
@@ -95,10 +92,6 @@ def _amx_process_weight_after_loading(
         if transpose_dims and transpose_dims[i]:
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
         is_conv_weight = is_dim_conv_weight(weight_tensor)
-
-        if envs.SGLANG_DISABLE_CPU_WEIGHT_PREPACK.get() and not is_conv_weight:
-            continue
-
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
         if (
             (not dim_is_supported(weight_tensor))
@@ -123,12 +116,9 @@ def _amx_process_weight_after_loading(
             weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
             weight_tensor.copy_(packed_weight)
 
-    if envs.SGLANG_DISABLE_CPU_WEIGHT_PREPACK.get():
-        module.use_intel_amx_backend = False
-    else:
-        module.use_intel_amx_backend = device == torch.device("cpu") and (
-            cpu_has_amx_support() or is_host_cpu_arm64()
-        )
+    module.use_intel_amx_backend = device == torch.device("cpu") and (
+        cpu_has_amx_support() or is_host_cpu_arm64()
+    )
 
     if (
         module.use_intel_amx_backend
