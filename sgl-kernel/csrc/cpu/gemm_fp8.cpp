@@ -258,65 +258,51 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
 
     const int KB = div_up(K, BLOCK_K);
 
-    // Accumulate in fp32
-    float acc[ROWS][BLOCK_N];
-    for (int m = 0; m < ROWS; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
-        acc[m][n] = has_bias ? bias[n] : 0.f;
-      }
-    }
-
-    // Process by blocks for block quantization scale
     const int lda2 = lda >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(B);
 
     constexpr int BLOCK_K2 = BLOCK_K >> 1;
-    for (int kb = 0; kb < KB; ++kb) {
-      int kb_start = kb * BLOCK_K2;
-      int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
-      float block_scale = scale[kb];
 
-      // Block accumulator
-      float block_acc[ROWS][BLOCK_N];
-      for (int m = 0; m < ROWS; ++m)
-        for (int n = 0; n < BLOCK_N; ++n)
-          block_acc[m][n] = 0.f;
+    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      svfloat32_t acc_reg[ROWS];
+      
+      for (int m = 0; m < ROWS; ++m) {
+        if (has_bias) {
+          acc_reg[m] = svld1_f32(pg, bias + n);
+        } else {
+          acc_reg[m] = svdup_n_f32(0.f);
+        }
+      }
 
-      for (int k = kb_start; k < kb_end; ++k) {
+      for (int kb = 0; kb < KB; ++kb) {
+        int kb_start = kb * BLOCK_K2;
+        int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
+        float block_scale = scale[kb];
+
+        svfloat32_t block_acc_reg[ROWS];
         for (int m = 0; m < ROWS; ++m) {
-          float a_val = a_ptr[m * lda2 + k];
-          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+          block_acc_reg[m] = svdup_n_f32(0.f);
+        }
 
-          for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-            svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-            svfloat32_t vc = svld1_f32(pg, block_acc[m] + n);
-            // Load FP8 packed as VNNI bf16 (already in bf16 pairs format)
-            svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(b_ptr) + k * ldb + n));
-            vc = svbfdot_f32(vc, va, vb);
-            svst1_f32(pg, block_acc[m] + n, vc);
+        for (int k = kb_start; k < kb_end; ++k) {
+          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(b_ptr) + k * ldb + n));
+          for (int m = 0; m < ROWS; ++m) {
+            float a_val = a_ptr[m * lda2 + k];
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+            block_acc_reg[m] = svbfdot_f32(block_acc_reg[m], va, vb);
           }
         }
-      }
 
-      // Apply block scale and accumulate
-      for (int m = 0; m < ROWS; ++m) {
-        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-          svfloat32_t va = svld1_f32(pg, acc[m] + n);
-          svfloat32_t vba = svld1_f32(pg, block_acc[m] + n);
-          va = svmla_f32_x(pg, va, vba, svdup_f32(block_scale));
-          svst1_f32(pg, acc[m] + n, va);
+        for (int m = 0; m < ROWS; ++m) {
+          acc_reg[m] = svmla_f32_x(pg, acc_reg[m], block_acc_reg[m], svdup_f32(block_scale));
         }
       }
-    }
 
-    // Store results: fp32 -> bf16
-    for (int m = 0; m < ROWS; ++m) {
-      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svfloat32_t vf = svld1_f32(pg, acc[m] + n);
-        svbfloat16_t vbf = sve_f32_to_bf16(pg, vf);
+      // Store results: fp32 -> bf16
+      for (int m = 0; m < ROWS; ++m) {
+        svbfloat16_t vbf = sve_f32_to_bf16(pg, acc_reg[m]);
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
       }
     }

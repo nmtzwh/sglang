@@ -383,49 +383,39 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
     constexpr int ROWS = BLOCK_M;
     const uint64_t vl_f32 = svcntw();
 
-    // Accumulate gate (C0) and up (C1) in fp32
-    float acc0[ROWS][BLOCK_N];
-    float acc1[ROWS][BLOCK_N];
-    for (int m = 0; m < ROWS; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
-        acc0[m][n] = 0.f;
-        acc1[m][n] = 0.f;
-      }
-    }
-
     const int64_t K2 = K >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;
 
-    for (int64_t k = 0; k < K2; ++k) {
+    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      
+      svfloat32_t acc0_reg[ROWS];
+      svfloat32_t acc1_reg[ROWS];
       for (int m = 0; m < ROWS; ++m) {
-        float a_val = a_ptr[m * lda2 + k];
-        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+        acc0_reg[m] = svdup_n_f32(0.f);
+        acc1_reg[m] = svdup_n_f32(0.f);
+      }
 
+      for (int64_t k = 0; k < K2; ++k) {
         const float* b0_row = reinterpret_cast<const float*>(B0) + k * ldb2;
         const float* b1_row = reinterpret_cast<const float*>(B1) + k * ldb2;
+        svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg, b0_row + n));
+        svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg, b1_row + n));
 
-        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-          svfloat32_t vc0 = svld1_f32(pg, acc0[m] + n);
-          svfloat32_t vc1 = svld1_f32(pg, acc1[m] + n);
-          svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg, b0_row + n));
-          svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg, b1_row + n));
-          vc0 = svbfdot_f32(vc0, va, vb0);
-          vc1 = svbfdot_f32(vc1, va, vb1);
-          svst1_f32(pg, acc0[m] + n, vc0);
-          svst1_f32(pg, acc1[m] + n, vc1);
+        for (int m = 0; m < ROWS; ++m) {
+          float a_val = a_ptr[m * lda2 + k];
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+          acc0_reg[m] = svbfdot_f32(acc0_reg[m], va, vb0);
+          acc1_reg[m] = svbfdot_f32(acc1_reg[m], va, vb1);
         }
       }
-    }
 
-    // Store: SiLU(acc0) * acc1 -> bf16
-    for (int m = 0; m < ROWS; ++m) {
-      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svfloat32_t vx = svld1_f32(pg, acc0[m] + n);
-        svfloat32_t vy = svld1_f32(pg, acc1[m] + n);
+      // Store: SiLU(acc0) * acc1 -> bf16
+      for (int m = 0; m < ROWS; ++m) {
+        svfloat32_t vx = acc0_reg[m];
+        svfloat32_t vy = acc1_reg[m];
         // SiLU: x / (1 + exp(-x))
         svfloat32_t vneg_x = svneg_f32_x(pg, vx);
         svfloat32_t vexp = sve_fexp_u20(pg, vneg_x);
@@ -584,39 +574,31 @@ struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
     constexpr int ROWS = BLOCK_M;
     const uint64_t vl_f32 = svcntw();
 
-    float acc[ROWS][BLOCK_N];
-    for (int m = 0; m < ROWS; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
-        acc[m][n] = 0.f;
-      }
-    }
-
     const int64_t K2 = K >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;
 
-    for (int64_t k = 0; k < K2; ++k) {
+    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      svfloat32_t acc_reg[ROWS];
       for (int m = 0; m < ROWS; ++m) {
-        float a_val = a_ptr[m * lda2 + k];
-        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+        acc_reg[m] = svdup_n_f32(0.f);
+      }
 
+      for (int64_t k = 0; k < K2; ++k) {
         const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
-        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-          svfloat32_t vc = svld1_f32(pg, acc[m] + n);
-          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
-          vc = svbfdot_f32(vc, va, vb);
-          svst1_f32(pg, acc[m] + n, vc);
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
+
+        for (int m = 0; m < ROWS; ++m) {
+          float a_val = a_ptr[m * lda2 + k];
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+          acc_reg[m] = svbfdot_f32(acc_reg[m], va, vb);
         }
       }
-    }
 
-    for (int m = 0; m < ROWS; ++m) {
-      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svfloat32_t vc = svld1_f32(pg, acc[m] + n);
-        svst1_f32(pg, C + m * ldc + n, vc);
+      for (int m = 0; m < ROWS; ++m) {
+        svst1_f32(pg, C + m * ldc + n, acc_reg[m]);
       }
     }
   }

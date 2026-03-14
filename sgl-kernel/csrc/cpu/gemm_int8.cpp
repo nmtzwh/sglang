@@ -210,14 +210,6 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     constexpr int ROWS = BLOCK_M;
     const uint64_t vl_s32 = svcntw();
 
-    // Accumulate in int32
-    int32_t acc[ROWS][BLOCK_N];
-    for (int m = 0; m < ROWS; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
-        acc[m][n] = 0;
-      }
-    }
-
     // K is in bytes, each dot-product processes 4 bytes
     const int64_t K4 = K >> 2;
     const int32_t* a_ptr = reinterpret_cast<const int32_t*>(A);
@@ -225,35 +217,41 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     const int32_t* b_ptr = reinterpret_cast<const int32_t*>(B);
     const int64_t ldb4 = ldb;
 
-    for (int64_t k = 0; k < K4; ++k) {
+    for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      
+      // Initialize int32 accumulators in registers
+      svint32_t acc_reg[ROWS];
       for (int m = 0; m < ROWS; ++m) {
-        int32_t a_val = a_ptr[m * lda4 + k];
-        // Broadcast A as uint8x4 packed in int32
-        svuint8_t va = svreinterpret_u8(svdup_s32(a_val));
+        acc_reg[m] = svdup_n_s32(0);
+      }
 
+      for (int64_t k = 0; k < K4; ++k) {
         const int32_t* b_row = b_ptr + k * ldb4;
-        for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
-          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-          svint32_t vc = svld1_s32(pg, acc[m] + n);
-          svint8_t vb = svreinterpret_s8(svld1_s32(pg, b_row + n));
-          vc = svdot_s32(vc, svreinterpret_s8(va), vb);
-          svst1_s32(pg, acc[m] + n, vc);
+        svint8_t vb = svreinterpret_s8(svld1_s32(pg, b_row + n));
+        
+        for (int m = 0; m < ROWS; ++m) {
+          int32_t a_val = a_ptr[m * lda4 + k];
+          // Broadcast A as uint8x4 packed in int32
+          svuint8_t va = svreinterpret_u8(svdup_s32(a_val));
+          acc_reg[m] = svdot_s32(acc_reg[m], svreinterpret_s8(va), vb);
         }
       }
-    }
 
-    // Dequantize: (acc - Bcomp) * As * Bs + bias
-    for (int m = 0; m < ROWS; ++m) {
-      float as_val = As[m];
-      for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
-        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svint32_t vc = svld1_s32(pg, acc[m] + n);
-        svint32_t vcomp = svld1_s32(pg, Bcomp + n);
+      // Dequantize: (acc - Bcomp) * As * Bs + bias
+      svint32_t vcomp = svld1_s32(pg, Bcomp + n);
+      svfloat32_t vbs = svld1_f32(pg, Bs + n);
+      svfloat32_t vbias;
+      if (has_bias) {
+        vbias = svld1_f32(pg, bias + n);
+      }
+      
+      for (int m = 0; m < ROWS; ++m) {
+        float as_val = As[m];
+        svint32_t vc = acc_reg[m];
         svfloat32_t vf = svcvt_f32_s32_x(pg, svsub_s32_x(pg, vc, vcomp));
-        svfloat32_t vbs = svld1_f32(pg, Bs + n);
         vf = svmul_f32_x(pg, svmul_f32_x(pg, vf, svdup_f32(as_val)), vbs);
         if (has_bias) {
-          svfloat32_t vbias = svld1_f32(pg, bias + n);
           vf = svadd_f32_x(pg, vf, vbias);
         }
         // Convert to bf16 and store

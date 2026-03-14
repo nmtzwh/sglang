@@ -264,54 +264,43 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       int64_t ldb,
       int64_t ldc) {
     const uint64_t vl_f32 = svcntw();  // number of f32 elements per SVE vector
-
-    // Accumulate in fp32
-    // We process BLOCK_N columns in chunks of vl_f32
-    // C[m][n] = sum_k A[m][k] * B[k/2][n][2]  (VNNI layout)
     constexpr int ROWS = BLOCK_M;
 
-    // Allocate fp32 accumulators for each row
-    // We process N in strips of vl_f32 (SVE vector width in fp32)
-    float acc[ROWS][BLOCK_N];
-
-    // Initialize accumulators
-    for (int m = 0; m < ROWS; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
-        acc[m][n] = has_bias ? bias[n] : 0.f;
-      }
-    }
-
-    // K dimension: VNNI format has pairs of bf16 packed as 32-bit
     const int64_t K2 = K >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;
 
-    for (int64_t k = 0; k < K2; ++k) {
+    // Process N in SVE-width chunks
+    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      
+      // Initialize fp32 accumulators in registers
+      svfloat32_t acc_reg[ROWS];
       for (int m = 0; m < ROWS; ++m) {
-        // Broadcast A[m][k] (pair of bf16 as float32)
-        float a_val = a_ptr[m * lda2 + k];
-        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
-
-        // Process N in SVE-width chunks
-        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
-        for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-          svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-          svfloat32_t vc = svld1_f32(pg, acc[m] + n);
-          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
-          vc = svbfdot_f32(vc, va, vb);
-          svst1_f32(pg, acc[m] + n, vc);
+        if (has_bias) {
+          acc_reg[m] = svld1_f32(pg, bias + n);
+        } else {
+          acc_reg[m] = svdup_n_f32(0.f);
         }
       }
-    }
 
-    // Store results: convert fp32 -> bf16
-    for (int m = 0; m < ROWS; ++m) {
-      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-        svbool_t pg32 = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svfloat32_t vf = svld1_f32(pg32, acc[m] + n);
-        // Convert fp32 to bf16 and store
-        svbfloat16_t vbf = sve_f32_to_bf16(pg32, vf);
+      // K dimension: VNNI format has pairs of bf16 packed as 32-bit
+      for (int64_t k = 0; k < K2; ++k) {
+        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
+        
+        for (int m = 0; m < ROWS; ++m) {
+          // Broadcast A[m][k] (pair of bf16 as float32)
+          float a_val = a_ptr[m * lda2 + k];
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
+          acc_reg[m] = svbfdot_f32(acc_reg[m], va, vb);
+        }
+      }
+
+      // Store results: convert fp32 -> bf16
+      for (int m = 0; m < ROWS; ++m) {
+        svbfloat16_t vbf = sve_f32_to_bf16(pg, acc_reg[m]);
         // Store low half of bf16 vector (matches the fp32 element count)
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
       }

@@ -592,25 +592,32 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     const uint64_t vl_f32 = svcntw();
 
     // C[m][n] = scale[m]*C[m][n] + sum_k(A[m][k] * B[ind[k]][n])
-    for (int m = 0; m < ROWS; ++m) {
-      float s = scale[m];
-      // Process N in SVE-width chunks
-      for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-        svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-        svfloat32_t vc = svld1_f32(pg, C + m * ldc + n);
-        vc = svmul_f32_x(pg, vc, svdup_f32(s));
+    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      svfloat32_t vc_reg[ROWS];
+      
+      for (int m = 0; m < ROWS; ++m) {
+        vc_reg[m] = svld1_f32(pg, C + m * ldc + n);
+        vc_reg[m] = svmul_f32_x(pg, vc_reg[m], svdup_f32(scale[m]));
+      }
 
-        for (int64_t k = 0; k < K; ++k) {
-          int64_t b_idx = indices[k];
-          TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
+      for (int64_t k = 0; k < K; ++k) {
+        int64_t b_idx = indices[k];
+        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
+        
+        // Load B[b_idx][n..n+vl] as bf16 -> fp32
+        svbfloat16_t vb_bf16 = svld1_bf16(
+            svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<const bfloat16_t*>(B + b_idx * ldb + n));
+        svfloat32_t vb = sve_cvt_bf16_to_fp32_low(vb_bf16);
+
+        for (int m = 0; m < ROWS; ++m) {
           float a_val = A[m * lda + k];
-          // Load B[b_idx][n..n+vl] as bf16 -> fp32
-          svbfloat16_t vb_bf16 = svld1_bf16(
-              svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<const bfloat16_t*>(B + b_idx * ldb + n));
-          svfloat32_t vb = sve_cvt_bf16_to_fp32_low(vb_bf16);
-          vc = svmla_f32_x(pg, vc, svdup_f32(a_val), vb);
+          vc_reg[m] = svmla_f32_x(pg, vc_reg[m], svdup_f32(a_val), vb);
         }
-        svst1_f32(pg, C + m * ldc + n, vc);
+      }
+
+      for (int m = 0; m < ROWS; ++m) {
+        svst1_f32(pg, C + m * ldc + n, vc_reg[m]);
       }
     }
   }
