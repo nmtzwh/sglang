@@ -131,5 +131,5 @@ target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops
-    LIBRARY DESTINATION sgl_kernel/sm100
+    LIBRARY DESTINATION sgl_kernel
 )
