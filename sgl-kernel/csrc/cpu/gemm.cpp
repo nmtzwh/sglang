@@ -271,39 +271,145 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;
 
-    // Process N in SVE-width chunks
-    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+    // Process N in 4-vector chunks
+    for (int64_t n = 0; n < BLOCK_N; n += 4 * vl_f32) {
+      svbool_t pg0 = svwhilelt_b32((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N);
+      svbool_t pg1 = svwhilelt_b32((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N);
+      svbool_t pg2 = svwhilelt_b32((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N);
+      svbool_t pg3 = svwhilelt_b32((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N);
       
-      // Use individual SVE registers to avoid array-of-SVE-types issues
-      svfloat32_t acc0 = svdup_n_f32(0.f);
-      svfloat32_t acc1 = svdup_n_f32(0.f);
-      svfloat32_t acc2 = svdup_n_f32(0.f);
-      svfloat32_t acc3 = svdup_n_f32(0.f);
+      svfloat32_t acc00 = svdup_n_f32(0.f), acc01 = svdup_n_f32(0.f), acc02 = svdup_n_f32(0.f), acc03 = svdup_n_f32(0.f);
+      svfloat32_t acc10 = svdup_n_f32(0.f), acc11 = svdup_n_f32(0.f), acc12 = svdup_n_f32(0.f), acc13 = svdup_n_f32(0.f);
+      svfloat32_t acc20 = svdup_n_f32(0.f), acc21 = svdup_n_f32(0.f), acc22 = svdup_n_f32(0.f), acc23 = svdup_n_f32(0.f);
+      svfloat32_t acc30 = svdup_n_f32(0.f), acc31 = svdup_n_f32(0.f), acc32 = svdup_n_f32(0.f), acc33 = svdup_n_f32(0.f);
 
       if (has_bias) {
-        if (ROWS >= 1) acc0 = svld1_f32(pg, bias + n);
-        if (ROWS >= 2) acc1 = svld1_f32(pg, bias + n);
-        if (ROWS >= 3) acc2 = svld1_f32(pg, bias + n);
-        if (ROWS >= 4) acc3 = svld1_f32(pg, bias + n);
+        if (ROWS >= 1) {
+          acc00 = svld1_f32(pg0, bias + n + 0 * vl_f32);
+          acc01 = svld1_f32(pg1, bias + n + 1 * vl_f32);
+          acc02 = svld1_f32(pg2, bias + n + 2 * vl_f32);
+          acc03 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+        }
+        if (ROWS >= 2) {
+          acc10 = svld1_f32(pg0, bias + n + 0 * vl_f32);
+          acc11 = svld1_f32(pg1, bias + n + 1 * vl_f32);
+          acc12 = svld1_f32(pg2, bias + n + 2 * vl_f32);
+          acc13 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+        }
+        if (ROWS >= 3) {
+          acc20 = svld1_f32(pg0, bias + n + 0 * vl_f32);
+          acc21 = svld1_f32(pg1, bias + n + 1 * vl_f32);
+          acc22 = svld1_f32(pg2, bias + n + 2 * vl_f32);
+          acc23 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+        }
+        if (ROWS >= 4) {
+          acc30 = svld1_f32(pg0, bias + n + 0 * vl_f32);
+          acc31 = svld1_f32(pg1, bias + n + 1 * vl_f32);
+          acc32 = svld1_f32(pg2, bias + n + 2 * vl_f32);
+          acc33 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+        }
       }
 
       // K dimension: VNNI format has pairs of bf16 packed as 32-bit
-      for (int64_t k = 0; k < K2; ++k) {
-        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
-        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
+      int64_t k = 0;
+      for (; k < K2 - 1; k += 2) {
+        svbfloat16_t vb0_0 = svreinterpret_bf16(svld1_f32(pg0, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 0 * vl_f32));
+        svbfloat16_t vb0_1 = svreinterpret_bf16(svld1_f32(pg1, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 1 * vl_f32));
+        svbfloat16_t vb0_2 = svreinterpret_bf16(svld1_f32(pg2, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 2 * vl_f32));
+        svbfloat16_t vb0_3 = svreinterpret_bf16(svld1_f32(pg3, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 3 * vl_f32));
+
+        svbfloat16_t vb1_0 = svreinterpret_bf16(svld1_f32(pg0, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 0 * vl_f32));
+        svbfloat16_t vb1_1 = svreinterpret_bf16(svld1_f32(pg1, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 1 * vl_f32));
+        svbfloat16_t vb1_2 = svreinterpret_bf16(svld1_f32(pg2, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 2 * vl_f32));
+        svbfloat16_t vb1_3 = svreinterpret_bf16(svld1_f32(pg3, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 3 * vl_f32));
         
-        if (ROWS >= 1) acc0 = svbfdot_f32(acc0, svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k])), vb);
-        if (ROWS >= 2) acc1 = svbfdot_f32(acc1, svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k])), vb);
-        if (ROWS >= 3) acc2 = svbfdot_f32(acc2, svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k])), vb);
-        if (ROWS >= 4) acc3 = svbfdot_f32(acc3, svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k])), vb);
+        if (ROWS >= 1) {
+          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k + 0]));
+          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k + 1]));
+          acc00 = svbfdot_f32(acc00, va0, vb0_0); acc01 = svbfdot_f32(acc01, va0, vb0_1);
+          acc02 = svbfdot_f32(acc02, va0, vb0_2); acc03 = svbfdot_f32(acc03, va0, vb0_3);
+          acc00 = svbfdot_f32(acc00, va1, vb1_0); acc01 = svbfdot_f32(acc01, va1, vb1_1);
+          acc02 = svbfdot_f32(acc02, va1, vb1_2); acc03 = svbfdot_f32(acc03, va1, vb1_3);
+        }
+        if (ROWS >= 2) {
+          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k + 0]));
+          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k + 1]));
+          acc10 = svbfdot_f32(acc10, va0, vb0_0); acc11 = svbfdot_f32(acc11, va0, vb0_1);
+          acc12 = svbfdot_f32(acc12, va0, vb0_2); acc13 = svbfdot_f32(acc13, va0, vb0_3);
+          acc10 = svbfdot_f32(acc10, va1, vb1_0); acc11 = svbfdot_f32(acc11, va1, vb1_1);
+          acc12 = svbfdot_f32(acc12, va1, vb1_2); acc13 = svbfdot_f32(acc13, va1, vb1_3);
+        }
+        if (ROWS >= 3) {
+          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k + 0]));
+          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k + 1]));
+          acc20 = svbfdot_f32(acc20, va0, vb0_0); acc21 = svbfdot_f32(acc21, va0, vb0_1);
+          acc22 = svbfdot_f32(acc22, va0, vb0_2); acc23 = svbfdot_f32(acc23, va0, vb0_3);
+          acc20 = svbfdot_f32(acc20, va1, vb1_0); acc21 = svbfdot_f32(acc21, va1, vb1_1);
+          acc22 = svbfdot_f32(acc22, va1, vb1_2); acc23 = svbfdot_f32(acc23, va1, vb1_3);
+        }
+        if (ROWS >= 4) {
+          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k + 0]));
+          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k + 1]));
+          acc30 = svbfdot_f32(acc30, va0, vb0_0); acc31 = svbfdot_f32(acc31, va0, vb0_1);
+          acc32 = svbfdot_f32(acc32, va0, vb0_2); acc33 = svbfdot_f32(acc33, va0, vb0_3);
+          acc30 = svbfdot_f32(acc30, va1, vb1_0); acc31 = svbfdot_f32(acc31, va1, vb1_1);
+          acc32 = svbfdot_f32(acc32, va1, vb1_2); acc33 = svbfdot_f32(acc33, va1, vb1_3);
+        }
+      }
+      for (; k < K2; ++k) {
+        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
+        svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg0, b_row + n + 0 * vl_f32));
+        svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg1, b_row + n + 1 * vl_f32));
+        svbfloat16_t vb2 = svreinterpret_bf16(svld1_f32(pg2, b_row + n + 2 * vl_f32));
+        svbfloat16_t vb3 = svreinterpret_bf16(svld1_f32(pg3, b_row + n + 3 * vl_f32));
+        
+        if (ROWS >= 1) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k]));
+          acc00 = svbfdot_f32(acc00, va, vb0); acc01 = svbfdot_f32(acc01, va, vb1);
+          acc02 = svbfdot_f32(acc02, va, vb2); acc03 = svbfdot_f32(acc03, va, vb3);
+        }
+        if (ROWS >= 2) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k]));
+          acc10 = svbfdot_f32(acc10, va, vb0); acc11 = svbfdot_f32(acc11, va, vb1);
+          acc12 = svbfdot_f32(acc12, va, vb2); acc13 = svbfdot_f32(acc13, va, vb3);
+        }
+        if (ROWS >= 3) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k]));
+          acc20 = svbfdot_f32(acc20, va, vb0); acc21 = svbfdot_f32(acc21, va, vb1);
+          acc22 = svbfdot_f32(acc22, va, vb2); acc23 = svbfdot_f32(acc23, va, vb3);
+        }
+        if (ROWS >= 4) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k]));
+          acc30 = svbfdot_f32(acc30, va, vb0); acc31 = svbfdot_f32(acc31, va, vb1);
+          acc32 = svbfdot_f32(acc32, va, vb2); acc33 = svbfdot_f32(acc33, va, vb3);
+        }
       }
 
-      // Store results: convert fp32 -> bf16
-      if (ROWS >= 1) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n), sve_f32_to_bf16(pg, acc0));
-      if (ROWS >= 2) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n), sve_f32_to_bf16(pg, acc1));
-      if (ROWS >= 3) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n), sve_f32_to_bf16(pg, acc2));
-      if (ROWS >= 4) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n), sve_f32_to_bf16(pg, acc3));
+      // Store results
+      if (ROWS >= 1) {
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc00));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc01));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc02));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc03));
+      }
+      if (ROWS >= 2) {
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc10));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc11));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc12));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc13));
+      }
+      if (ROWS >= 3) {
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc20));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc21));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc22));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc23));
+      }
+      if (ROWS >= 4) {
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc30));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc31));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc32));
+        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc33));
+      }
     }
   }
 };
@@ -499,6 +605,23 @@ void weight_packed_linear_kernel_impl(
     parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+      
+      // Locality optimization: Pack A for large M
+      const bool should_pack_a = (M > 16) && !use_brgemm;
+      const int64_t rows_a = (mb1 - mb0) * BLOCK_M;
+      std::vector<scalar_t> a_packed_vec;
+      if (should_pack_a) {
+          a_packed_vec.resize(rows_a * K);
+          scalar_t* a_packed_ptr = a_packed_vec.data();
+          for (int64_t i = 0; i < rows_a; ++i) {
+              int64_t m = mb0 * BLOCK_M + i;
+              if (m < M) {
+                  std::memcpy(a_packed_ptr + i * K, mat1 + m * mat1_strideM, K * sizeof(scalar_t));
+              }
+          }
+      }
+      const scalar_t* mat1_ptr = should_pack_a ? a_packed_vec.data() : mat1;
+      const int64_t mat1_stride = should_pack_a ? K : mat1_strideM;
 
       loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         int64_t mb_start = mb * BLOCK_M;
@@ -506,8 +629,11 @@ void weight_packed_linear_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(N - nb_start, BLOCK_N);
 
+        // Adjust mb_start relative to packed buffer if needed
+        int64_t current_mb_start = should_pack_a ? (mb - mb0) * BLOCK_M : mb_start;
+
         tinygemm_kernel<scalar_t, has_bias>(
-            /*   A */ mat1 + mb_start * mat1_strideM,
+            /*   A */ mat1_ptr + current_mb_start * mat1_stride,
             /*   B */ mat2 + nb_start * K /* nb * BLOCK_N * K */,
             /*   C */ out + mb_start * out_strideM + nb_start,
             /* Ctmp*/ Ctmp,
@@ -515,7 +641,7 @@ void weight_packed_linear_kernel_impl(
             /*   M */ mb_size,
             /*   N */ nb_size,
             /*   K */ K,
-            /* lda */ mat1_strideM,
+            /* lda */ mat1_stride,
             /* ldb */ nb_size,
             /* ldc */ out_strideM,
             /* brg */ use_brgemm);
