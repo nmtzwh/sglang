@@ -222,6 +222,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
         return query_out, key_out
 
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets=None,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # sgl-kernel rotary_embedding_cpu only supports 1D positions (standard RoPE).
+        # MRoPE uses 2D positions and mrope_section; use native implementation on CPU.
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+
     @staticmethod
     def get_rope_index(
         spatial_merge_size,
