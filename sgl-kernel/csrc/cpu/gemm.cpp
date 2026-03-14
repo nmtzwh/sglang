@@ -251,7 +251,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 #endif
 
 #if defined(CPU_CAPABILITY_SVE)
-// SVE VL-agnostic bf16 GEMM micro-kernel using svbfdot
+// Optimized SVE bf16 GEMM micro-kernel with 6x4 register blocking
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -263,7 +263,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       int64_t lda,
       int64_t ldb,
       int64_t ldc) {
-    const uint64_t vl_f32 = svcntw();  // number of f32 elements per SVE vector
+    const uint64_t vl_f32 = svcntw();
     constexpr int ROWS = BLOCK_M;
 
     const int64_t K2 = K >> 1;
@@ -271,145 +271,139 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     const int64_t lda2 = lda >> 1;
     const int64_t ldb2 = ldb;
 
-    // Process N in 4-vector chunks
     for (int64_t n = 0; n < BLOCK_N; n += 4 * vl_f32) {
       svbool_t pg0 = svwhilelt_b32((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N);
       svbool_t pg1 = svwhilelt_b32((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N);
       svbool_t pg2 = svwhilelt_b32((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N);
       svbool_t pg3 = svwhilelt_b32((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N);
       
-      svfloat32_t acc00 = svdup_n_f32(0.f), acc01 = svdup_n_f32(0.f), acc02 = svdup_n_f32(0.f), acc03 = svdup_n_f32(0.f);
-      svfloat32_t acc10 = svdup_n_f32(0.f), acc11 = svdup_n_f32(0.f), acc12 = svdup_n_f32(0.f), acc13 = svdup_n_f32(0.f);
-      svfloat32_t acc20 = svdup_n_f32(0.f), acc21 = svdup_n_f32(0.f), acc22 = svdup_n_f32(0.f), acc23 = svdup_n_f32(0.f);
-      svfloat32_t acc30 = svdup_n_f32(0.f), acc31 = svdup_n_f32(0.f), acc32 = svdup_n_f32(0.f), acc33 = svdup_n_f32(0.f);
+      svfloat32_t acc00, acc01, acc02, acc03;
+      svfloat32_t acc10, acc11, acc12, acc13;
+      svfloat32_t acc20, acc21, acc22, acc23;
+      svfloat32_t acc30, acc31, acc32, acc33;
+      svfloat32_t acc40, acc41, acc42, acc43;
+      svfloat32_t acc50, acc51, acc52, acc53;
 
-      if (has_bias) {
-        if (ROWS >= 1) {
-          acc00 = svld1_f32(pg0, bias + n + 0 * vl_f32);
-          acc01 = svld1_f32(pg1, bias + n + 1 * vl_f32);
-          acc02 = svld1_f32(pg2, bias + n + 2 * vl_f32);
-          acc03 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+      auto init_acc = [&](auto& a0, auto& a1, auto& a2, auto& a3, int r) {
+        if constexpr (has_bias) {
+          a0 = svld1_f32(pg0, bias + n + 0 * vl_f32);
+          a1 = svld1_f32(pg1, bias + n + 1 * vl_f32);
+          a2 = svld1_f32(pg2, bias + n + 2 * vl_f32);
+          a3 = svld1_f32(pg3, bias + n + 3 * vl_f32);
+        } else {
+          a0 = svdup_n_f32(0.f); a1 = svdup_n_f32(0.f);
+          a2 = svdup_n_f32(0.f); a3 = svdup_n_f32(0.f);
         }
-        if (ROWS >= 2) {
-          acc10 = svld1_f32(pg0, bias + n + 0 * vl_f32);
-          acc11 = svld1_f32(pg1, bias + n + 1 * vl_f32);
-          acc12 = svld1_f32(pg2, bias + n + 2 * vl_f32);
-          acc13 = svld1_f32(pg3, bias + n + 3 * vl_f32);
-        }
-        if (ROWS >= 3) {
-          acc20 = svld1_f32(pg0, bias + n + 0 * vl_f32);
-          acc21 = svld1_f32(pg1, bias + n + 1 * vl_f32);
-          acc22 = svld1_f32(pg2, bias + n + 2 * vl_f32);
-          acc23 = svld1_f32(pg3, bias + n + 3 * vl_f32);
-        }
-        if (ROWS >= 4) {
-          acc30 = svld1_f32(pg0, bias + n + 0 * vl_f32);
-          acc31 = svld1_f32(pg1, bias + n + 1 * vl_f32);
-          acc32 = svld1_f32(pg2, bias + n + 2 * vl_f32);
-          acc33 = svld1_f32(pg3, bias + n + 3 * vl_f32);
-        }
-      }
+      };
 
-      // K dimension: VNNI format has pairs of bf16 packed as 32-bit
+      if constexpr (ROWS >= 1) init_acc(acc00, acc01, acc02, acc03, 0);
+      if constexpr (ROWS >= 2) init_acc(acc10, acc11, acc12, acc13, 1);
+      if constexpr (ROWS >= 3) init_acc(acc20, acc21, acc22, acc23, 2);
+      if constexpr (ROWS >= 4) init_acc(acc30, acc31, acc32, acc33, 3);
+      if constexpr (ROWS >= 5) init_acc(acc40, acc41, acc42, acc43, 4);
+      if constexpr (ROWS >= 6) init_acc(acc50, acc51, acc52, acc53, 5);
+
       int64_t k = 0;
-      for (; k < K2 - 1; k += 2) {
-        svbfloat16_t vb0_0 = svreinterpret_bf16(svld1_f32(pg0, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 0 * vl_f32));
-        svbfloat16_t vb0_1 = svreinterpret_bf16(svld1_f32(pg1, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 1 * vl_f32));
-        svbfloat16_t vb0_2 = svreinterpret_bf16(svld1_f32(pg2, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 2 * vl_f32));
-        svbfloat16_t vb0_3 = svreinterpret_bf16(svld1_f32(pg3, reinterpret_cast<const float*>(B) + (k + 0) * ldb2 + n + 3 * vl_f32));
-
-        svbfloat16_t vb1_0 = svreinterpret_bf16(svld1_f32(pg0, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 0 * vl_f32));
-        svbfloat16_t vb1_1 = svreinterpret_bf16(svld1_f32(pg1, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 1 * vl_f32));
-        svbfloat16_t vb1_2 = svreinterpret_bf16(svld1_f32(pg2, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 2 * vl_f32));
-        svbfloat16_t vb1_3 = svreinterpret_bf16(svld1_f32(pg3, reinterpret_cast<const float*>(B) + (k + 1) * ldb2 + n + 3 * vl_f32));
-        
-        if (ROWS >= 1) {
-          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k + 0]));
-          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k + 1]));
-          acc00 = svbfdot_f32(acc00, va0, vb0_0); acc01 = svbfdot_f32(acc01, va0, vb0_1);
-          acc02 = svbfdot_f32(acc02, va0, vb0_2); acc03 = svbfdot_f32(acc03, va0, vb0_3);
-          acc00 = svbfdot_f32(acc00, va1, vb1_0); acc01 = svbfdot_f32(acc01, va1, vb1_1);
-          acc02 = svbfdot_f32(acc02, va1, vb1_2); acc03 = svbfdot_f32(acc03, va1, vb1_3);
+      for (; k <= K2 - 4; k += 4) {
+        const float* b_base = reinterpret_cast<const float*>(B) + n;
+        #define COMPUTE_K_STEP(K_OFF) \
+        { \
+          svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg0, b_base + (k + K_OFF) * ldb2 + 0 * vl_f32)); \
+          svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg1, b_base + (k + K_OFF) * ldb2 + 1 * vl_f32)); \
+          svbfloat16_t vb2 = svreinterpret_bf16(svld1_f32(pg2, b_base + (k + K_OFF) * ldb2 + 2 * vl_f32)); \
+          svbfloat16_t vb3 = svreinterpret_bf16(svld1_f32(pg3, b_base + (k + K_OFF) * ldb2 + 3 * vl_f32)); \
+          if constexpr (ROWS >= 1) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k + K_OFF])); \
+            acc00 = svbfdot_f32(acc00, va, vb0); acc01 = svbfdot_f32(acc01, va, vb1); \
+            acc02 = svbfdot_f32(acc02, va, vb2); acc03 = svbfdot_f32(acc03, va, vb3); \
+          } \
+          if constexpr (ROWS >= 2) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k + K_OFF])); \
+            acc10 = svbfdot_f32(acc10, va, vb0); acc11 = svbfdot_f32(acc11, va, vb1); \
+            acc12 = svbfdot_f32(acc12, va, vb2); acc13 = svbfdot_f32(acc13, va, vb3); \
+          } \
+          if constexpr (ROWS >= 3) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k + K_OFF])); \
+            acc20 = svbfdot_f32(acc20, va, vb0); acc21 = svbfdot_f32(acc21, va, vb1); \
+            acc22 = svbfdot_f32(acc22, va, vb2); acc23 = svbfdot_f32(acc23, va, vb3); \
+          } \
+          if constexpr (ROWS >= 4) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k + K_OFF])); \
+            acc30 = svbfdot_f32(acc30, va, vb0); acc31 = svbfdot_f32(acc31, va, vb1); \
+            acc32 = svbfdot_f32(acc32, va, vb2); acc33 = svbfdot_f32(acc33, va, vb3); \
+          } \
+          if constexpr (ROWS >= 5) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[4 * lda2 + k + K_OFF])); \
+            acc40 = svbfdot_f32(acc40, va, vb0); acc41 = svbfdot_f32(acc41, va, vb1); \
+            acc42 = svbfdot_f32(acc42, va, vb2); acc43 = svbfdot_f32(acc43, va, vb3); \
+          } \
+          if constexpr (ROWS >= 6) { \
+            svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[5 * lda2 + k + K_OFF])); \
+            acc50 = svbfdot_f32(acc50, va, vb0); acc51 = svbfdot_f32(acc51, va, vb1); \
+            acc52 = svbfdot_f32(acc52, va, vb2); acc53 = svbfdot_f32(acc53, va, vb3); \
+          } \
         }
-        if (ROWS >= 2) {
-          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k + 0]));
-          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k + 1]));
-          acc10 = svbfdot_f32(acc10, va0, vb0_0); acc11 = svbfdot_f32(acc11, va0, vb0_1);
-          acc12 = svbfdot_f32(acc12, va0, vb0_2); acc13 = svbfdot_f32(acc13, va0, vb0_3);
-          acc10 = svbfdot_f32(acc10, va1, vb1_0); acc11 = svbfdot_f32(acc11, va1, vb1_1);
-          acc12 = svbfdot_f32(acc12, va1, vb1_2); acc13 = svbfdot_f32(acc13, va1, vb1_3);
-        }
-        if (ROWS >= 3) {
-          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k + 0]));
-          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k + 1]));
-          acc20 = svbfdot_f32(acc20, va0, vb0_0); acc21 = svbfdot_f32(acc21, va0, vb0_1);
-          acc22 = svbfdot_f32(acc22, va0, vb0_2); acc23 = svbfdot_f32(acc23, va0, vb0_3);
-          acc20 = svbfdot_f32(acc20, va1, vb1_0); acc21 = svbfdot_f32(acc21, va1, vb1_1);
-          acc22 = svbfdot_f32(acc22, va1, vb1_2); acc23 = svbfdot_f32(acc23, va1, vb1_3);
-        }
-        if (ROWS >= 4) {
-          svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k + 0]));
-          svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k + 1]));
-          acc30 = svbfdot_f32(acc30, va0, vb0_0); acc31 = svbfdot_f32(acc31, va0, vb0_1);
-          acc32 = svbfdot_f32(acc32, va0, vb0_2); acc33 = svbfdot_f32(acc33, va0, vb0_3);
-          acc30 = svbfdot_f32(acc30, va1, vb1_0); acc31 = svbfdot_f32(acc31, va1, vb1_1);
-          acc32 = svbfdot_f32(acc32, va1, vb1_2); acc33 = svbfdot_f32(acc33, va1, vb1_3);
-        }
+        COMPUTE_K_STEP(0)
+        COMPUTE_K_STEP(1)
+        COMPUTE_K_STEP(2)
+        COMPUTE_K_STEP(3)
+        #undef COMPUTE_K_STEP
       }
+      
       for (; k < K2; ++k) {
-        const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
-        svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg0, b_row + n + 0 * vl_f32));
-        svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg1, b_row + n + 1 * vl_f32));
-        svbfloat16_t vb2 = svreinterpret_bf16(svld1_f32(pg2, b_row + n + 2 * vl_f32));
-        svbfloat16_t vb3 = svreinterpret_bf16(svld1_f32(pg3, b_row + n + 3 * vl_f32));
-        
-        if (ROWS >= 1) {
+        svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg0, reinterpret_cast<const float*>(B) + k * ldb2 + n + 0 * vl_f32));
+        svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg1, reinterpret_cast<const float*>(B) + k * ldb2 + n + 1 * vl_f32));
+        svbfloat16_t vb2 = svreinterpret_bf16(svld1_f32(pg2, reinterpret_cast<const float*>(B) + k * ldb2 + n + 2 * vl_f32));
+        svbfloat16_t vb3 = svreinterpret_bf16(svld1_f32(pg3, reinterpret_cast<const float*>(B) + k * ldb2 + n + 3 * vl_f32));
+        if constexpr (ROWS >= 1) {
           svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k]));
           acc00 = svbfdot_f32(acc00, va, vb0); acc01 = svbfdot_f32(acc01, va, vb1);
           acc02 = svbfdot_f32(acc02, va, vb2); acc03 = svbfdot_f32(acc03, va, vb3);
         }
-        if (ROWS >= 2) {
+        if constexpr (ROWS >= 2) {
           svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k]));
           acc10 = svbfdot_f32(acc10, va, vb0); acc11 = svbfdot_f32(acc11, va, vb1);
           acc12 = svbfdot_f32(acc12, va, vb2); acc13 = svbfdot_f32(acc13, va, vb3);
         }
-        if (ROWS >= 3) {
+        if constexpr (ROWS >= 3) {
           svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k]));
           acc20 = svbfdot_f32(acc20, va, vb0); acc21 = svbfdot_f32(acc21, va, vb1);
           acc22 = svbfdot_f32(acc22, va, vb2); acc23 = svbfdot_f32(acc23, va, vb3);
         }
-        if (ROWS >= 4) {
+        if constexpr (ROWS >= 4) {
           svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k]));
           acc30 = svbfdot_f32(acc30, va, vb0); acc31 = svbfdot_f32(acc31, va, vb1);
           acc32 = svbfdot_f32(acc32, va, vb2); acc33 = svbfdot_f32(acc33, va, vb3);
         }
+        if constexpr (ROWS >= 5) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[4 * lda2 + k]));
+          acc40 = svbfdot_f32(acc40, va, vb0); acc41 = svbfdot_f32(acc41, va, vb1);
+          acc42 = svbfdot_f32(acc42, va, vb2); acc43 = svbfdot_f32(acc43, va, vb3);
+        }
+        if constexpr (ROWS >= 6) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[5 * lda2 + k]));
+          acc50 = svbfdot_f32(acc50, va, vb0); acc51 = svbfdot_f32(acc51, va, vb1);
+          acc52 = svbfdot_f32(acc52, va, vb2); acc53 = svbfdot_f32(acc53, va, vb3);
+        }
       }
 
-      // Store results
-      if (ROWS >= 1) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc00));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc01));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc02));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc03));
-      }
-      if (ROWS >= 2) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc10));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc11));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc12));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc13));
-      }
-      if (ROWS >= 3) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc20));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc21));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc22));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc23));
-      }
-      if (ROWS >= 4) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc30));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc31));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc32));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc33));
-      }
+      auto store_acc = [&](auto a0, auto a1, auto a2, auto a3, int r) {
+        svbool_t p16_0 = svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N);
+        svbool_t p16_1 = svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N);
+        svbool_t p16_2 = svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N);
+        svbool_t p16_3 = svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N);
+        svst1_bf16(p16_0, reinterpret_cast<bfloat16_t*>(C + r * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, a0));
+        svst1_bf16(p16_1, reinterpret_cast<bfloat16_t*>(C + r * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, a1));
+        svst1_bf16(p16_2, reinterpret_cast<bfloat16_t*>(C + r * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, a2));
+        svst1_bf16(p16_3, reinterpret_cast<bfloat16_t*>(C + r * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, a3));
+      };
+
+      if constexpr (ROWS >= 1) store_acc(acc00, acc01, acc02, acc03, 0);
+      if constexpr (ROWS >= 2) store_acc(acc10, acc11, acc12, acc13, 1);
+      if constexpr (ROWS >= 3) store_acc(acc20, acc21, acc22, acc23, 2);
+      if constexpr (ROWS >= 4) store_acc(acc30, acc31, acc32, acc33, 3);
+      if constexpr (ROWS >= 5) store_acc(acc40, acc41, acc42, acc43, 4);
+      if constexpr (ROWS >= 6) store_acc(acc50, acc51, acc52, acc53, 5);
     }
   }
 };
@@ -488,8 +482,12 @@ void tinygemm_kernel(
     return;
   }
 
-  // pattern: 1-4-16, N = 16, 32, 48, 64
+  // Optimized for AArch64: Use BLOCK_M = 6 for better B-matrix reuse
+#if defined(__aarch64__) || defined(__arm64__)
+  constexpr int64_t BLOCK_M = 6;
+#else
   constexpr int64_t BLOCK_M = 4;
+#endif
   constexpr int64_t BLOCK_N = 64;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
@@ -500,61 +498,44 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (mb_size << 4 | nb_size >> 4) {
-        // mb_size = 1
-        case 0x11:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
-          break;
-        case 0x12:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
-          break;
-        case 0x13:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
-          break;
-        case 0x14:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
-          break;
-        // mb_size = 2
-        case 0x21:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 16);
-          break;
-        case 0x22:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
-          break;
-        case 0x23:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 48);
-          break;
-        case 0x24:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
-          break;
-        // mb_size = 3
-        case 0x31:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 16);
-          break;
-        case 0x32:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
-          break;
-        case 0x33:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 48);
-          break;
-        case 0x34:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
-          break;
-        // mb_size = 4
-        case 0x41:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 16);
-          break;
-        case 0x42:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
-          break;
-        case 0x43:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 48);
-          break;
-        case 0x44:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
-          break;
-        default:
-          TORCH_CHECK(false, "Unexpected block size, ", mb_size, " x ", nb_size);
+      if (mb_size == 6) {
+          switch (nb_size) {
+              case 16: LAUNCH_TINYGEMM_KERNEL_NN(6, 16); break;
+              case 32: LAUNCH_TINYGEMM_KERNEL_NN(6, 32); break;
+              case 48: LAUNCH_TINYGEMM_KERNEL_NN(6, 48); break;
+              case 64: LAUNCH_TINYGEMM_KERNEL_NN(6, 64); break;
+              default: LAUNCH_TINYGEMM_KERNEL_NN(6, 64); break;
+          }
+      } else {
+          switch (mb_size << 4 | nb_size >> 4) {
+            // mb_size = 1
+            case 0x11: LAUNCH_TINYGEMM_KERNEL_NN(1, 16); break;
+            case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
+            case 0x13: LAUNCH_TINYGEMM_KERNEL_NN(1, 48); break;
+            case 0x14: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
+            // mb_size = 2
+            case 0x21: LAUNCH_TINYGEMM_KERNEL_NN(2, 16); break;
+            case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
+            case 0x23: LAUNCH_TINYGEMM_KERNEL_NN(2, 48); break;
+            case 0x24: LAUNCH_TINYGEMM_KERNEL_NN(2, 64); break;
+            // mb_size = 3
+            case 0x31: LAUNCH_TINYGEMM_KERNEL_NN(3, 16); break;
+            case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
+            case 0x33: LAUNCH_TINYGEMM_KERNEL_NN(3, 48); break;
+            case 0x34: LAUNCH_TINYGEMM_KERNEL_NN(3, 64); break;
+            // mb_size = 4
+            case 0x41: LAUNCH_TINYGEMM_KERNEL_NN(4, 16); break;
+            case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
+            case 0x43: LAUNCH_TINYGEMM_KERNEL_NN(4, 48); break;
+            case 0x44: LAUNCH_TINYGEMM_KERNEL_NN(4, 64); break;
+            // mb_size = 5
+            case 0x51: LAUNCH_TINYGEMM_KERNEL_NN(5, 16); break;
+            case 0x52: LAUNCH_TINYGEMM_KERNEL_NN(5, 32); break;
+            case 0x53: LAUNCH_TINYGEMM_KERNEL_NN(5, 48); break;
+            case 0x54: LAUNCH_TINYGEMM_KERNEL_NN(5, 64); break;
+            default:
+              TORCH_CHECK(false, "Unexpected block size, ", mb_size, " x ", nb_size);
+          }
       }
     }
   }
@@ -593,8 +574,8 @@ void weight_packed_linear_kernel_impl(
     int64_t K,
     int64_t mat1_strideM,
     int64_t out_strideM) {
-  constexpr int64_t BLOCK_M = block_size_m();
-  constexpr int64_t BLOCK_N = block_size_n();
+  constexpr int64_t BLOCK_M = gemm_block_size_m();
+  constexpr int64_t BLOCK_N = gemm_block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
@@ -606,11 +587,14 @@ void weight_packed_linear_kernel_impl(
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
       
-      // Locality optimization: Pack A for large M
-      const bool should_pack_a = (M > 16) && !use_brgemm;
-      const int64_t rows_a = (mb1 - mb0) * BLOCK_M;
+      // OPTIMIZATION: Option 2 - Zero-Allocation / Conditional Packing
+      // Only pack A if it's actually non-contiguous or very large and helps cache.
+      // But for row-major contiguous A, packing is just a redundant memcpy.
+      const bool should_pack_a = (M > 16) && !use_brgemm && (mat1_strideM != K);
+      
       std::vector<scalar_t> a_packed_vec;
       if (should_pack_a) {
+          const int64_t rows_a = (mb1 - mb0) * BLOCK_M;
           a_packed_vec.resize(rows_a * K);
           scalar_t* a_packed_ptr = a_packed_vec.data();
           for (int64_t i = 0; i < rows_a; ++i) {
@@ -666,8 +650,8 @@ void weight_packed_linear_kernel_impl(
     int64_t K,
     int64_t mat1_strideM,
     int64_t out_strideM) {
-  constexpr int64_t BLOCK_M = block_size_m();
-  constexpr int64_t BLOCK_N = block_size_n();
+  constexpr int64_t BLOCK_M = gemm_block_size_m();
+  constexpr int64_t BLOCK_N = gemm_block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 

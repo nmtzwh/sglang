@@ -8,13 +8,30 @@
 #define TILE_N 16
 #define TILE_K 32
 
-// block size for AMX gemm
+// block size for AVX512/SVE vector operations (usually 32 for BF16)
 constexpr int block_size_m() {
   return 2 * TILE_M;
 }
 constexpr int block_size_n() {
   return 2 * TILE_N;
 }
+
+// Higher level GEMM tiling block size
+#if defined(__aarch64__) || defined(__arm64__)
+constexpr int gemm_block_size_m() {
+  return 64;
+}
+constexpr int gemm_block_size_n() {
+  return 64;
+}
+#else
+constexpr int gemm_block_size_m() {
+  return block_size_m();
+}
+constexpr int gemm_block_size_n() {
+  return block_size_n();
+}
+#endif
 
 // define threshold using brgemm (intel AMX)
 // On aarch64, brgemm is not available (AMX is x86-only),
@@ -133,7 +150,7 @@ void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
+    uint8_t* __restrict__ A_tmp,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
