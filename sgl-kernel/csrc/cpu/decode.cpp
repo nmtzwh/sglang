@@ -594,12 +594,15 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     // C[m][n] = scale[m]*C[m][n] + sum_k(A[m][k] * B[ind[k]][n])
     for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
       svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-      svfloat32_t vc_reg[ROWS];
       
-      for (int m = 0; m < ROWS; ++m) {
-        vc_reg[m] = svld1_f32(pg, C + m * ldc + n);
-        vc_reg[m] = svmul_f32_x(pg, vc_reg[m], svdup_f32(scale[m]));
-      }
+      svfloat32_t vc0 = svld1_f32(pg, C + 0 * ldc + n);
+      if (ROWS >= 1) vc0 = svmul_f32_x(pg, vc0, svdup_f32(scale[0]));
+      svfloat32_t vc1 = (ROWS >= 2) ? svld1_f32(pg, C + 1 * ldc + n) : svdup_n_f32(0.f);
+      if (ROWS >= 2) vc1 = svmul_f32_x(pg, vc1, svdup_f32(scale[1]));
+      svfloat32_t vc2 = (ROWS >= 3) ? svld1_f32(pg, C + 2 * ldc + n) : svdup_n_f32(0.f);
+      if (ROWS >= 3) vc2 = svmul_f32_x(pg, vc2, svdup_f32(scale[2]));
+      svfloat32_t vc3 = (ROWS >= 4) ? svld1_f32(pg, C + 3 * ldc + n) : svdup_n_f32(0.f);
+      if (ROWS >= 4) vc3 = svmul_f32_x(pg, vc3, svdup_f32(scale[3]));
 
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
@@ -610,15 +613,16 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
             svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<const bfloat16_t*>(B + b_idx * ldb + n));
         svfloat32_t vb = sve_cvt_bf16_to_fp32_low(vb_bf16);
 
-        for (int m = 0; m < ROWS; ++m) {
-          float a_val = A[m * lda + k];
-          vc_reg[m] = svmla_f32_x(pg, vc_reg[m], svdup_f32(a_val), vb);
-        }
+        if (ROWS >= 1) vc0 = svmla_f32_x(pg, vc0, svdup_f32(A[0 * lda + k]), vb);
+        if (ROWS >= 2) vc1 = svmla_f32_x(pg, vc1, svdup_f32(A[1 * lda + k]), vb);
+        if (ROWS >= 3) vc2 = svmla_f32_x(pg, vc2, svdup_f32(A[2 * lda + k]), vb);
+        if (ROWS >= 4) vc3 = svmla_f32_x(pg, vc3, svdup_f32(A[3 * lda + k]), vb);
       }
 
-      for (int m = 0; m < ROWS; ++m) {
-        svst1_f32(pg, C + m * ldc + n, vc_reg[m]);
-      }
+      if (ROWS >= 1) svst1_f32(pg, C + 0 * ldc + n, vc0);
+      if (ROWS >= 2) svst1_f32(pg, C + 1 * ldc + n, vc1);
+      if (ROWS >= 3) svst1_f32(pg, C + 2 * ldc + n, vc2);
+      if (ROWS >= 4) svst1_f32(pg, C + 3 * ldc + n, vc3);
     }
   }
 };

@@ -275,14 +275,17 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
       svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
       
-      // Initialize fp32 accumulators in registers
-      svfloat32_t acc_reg[ROWS];
-      for (int m = 0; m < ROWS; ++m) {
-        if (has_bias) {
-          acc_reg[m] = svld1_f32(pg, bias + n);
-        } else {
-          acc_reg[m] = svdup_n_f32(0.f);
-        }
+      // Use individual SVE registers to avoid array-of-SVE-types issues
+      svfloat32_t acc0 = svdup_n_f32(0.f);
+      svfloat32_t acc1 = svdup_n_f32(0.f);
+      svfloat32_t acc2 = svdup_n_f32(0.f);
+      svfloat32_t acc3 = svdup_n_f32(0.f);
+
+      if (has_bias) {
+        if (ROWS >= 1) acc0 = svld1_f32(pg, bias + n);
+        if (ROWS >= 2) acc1 = svld1_f32(pg, bias + n);
+        if (ROWS >= 3) acc2 = svld1_f32(pg, bias + n);
+        if (ROWS >= 4) acc3 = svld1_f32(pg, bias + n);
       }
 
       // K dimension: VNNI format has pairs of bf16 packed as 32-bit
@@ -290,20 +293,17 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
         const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
         svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
         
-        for (int m = 0; m < ROWS; ++m) {
-          // Broadcast A[m][k] (pair of bf16 as float32)
-          float a_val = a_ptr[m * lda2 + k];
-          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
-          acc_reg[m] = svbfdot_f32(acc_reg[m], va, vb);
-        }
+        if (ROWS >= 1) acc0 = svbfdot_f32(acc0, svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k])), vb);
+        if (ROWS >= 2) acc1 = svbfdot_f32(acc1, svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k])), vb);
+        if (ROWS >= 3) acc2 = svbfdot_f32(acc2, svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k])), vb);
+        if (ROWS >= 4) acc3 = svbfdot_f32(acc3, svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k])), vb);
       }
 
       // Store results: convert fp32 -> bf16
-      for (int m = 0; m < ROWS; ++m) {
-        svbfloat16_t vbf = sve_f32_to_bf16(pg, acc_reg[m]);
-        // Store low half of bf16 vector (matches the fp32 element count)
-        svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
-      }
+      if (ROWS >= 1) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n), sve_f32_to_bf16(pg, acc0));
+      if (ROWS >= 2) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n), sve_f32_to_bf16(pg, acc1));
+      if (ROWS >= 3) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n), sve_f32_to_bf16(pg, acc2));
+      if (ROWS >= 4) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n), sve_f32_to_bf16(pg, acc3));
     }
   }
 };

@@ -391,12 +391,14 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
     for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
       svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
       
-      svfloat32_t acc0_reg[ROWS];
-      svfloat32_t acc1_reg[ROWS];
-      for (int m = 0; m < ROWS; ++m) {
-        acc0_reg[m] = svdup_n_f32(0.f);
-        acc1_reg[m] = svdup_n_f32(0.f);
-      }
+      svfloat32_t acc0_0 = svdup_n_f32(0.f);
+      svfloat32_t acc0_1 = svdup_n_f32(0.f);
+      svfloat32_t acc0_2 = svdup_n_f32(0.f);
+      svfloat32_t acc0_3 = svdup_n_f32(0.f);
+      svfloat32_t acc1_0 = svdup_n_f32(0.f);
+      svfloat32_t acc1_1 = svdup_n_f32(0.f);
+      svfloat32_t acc1_2 = svdup_n_f32(0.f);
+      svfloat32_t acc1_3 = svdup_n_f32(0.f);
 
       for (int64_t k = 0; k < K2; ++k) {
         const float* b0_row = reinterpret_cast<const float*>(B0) + k * ldb2;
@@ -404,18 +406,30 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
         svbfloat16_t vb0 = svreinterpret_bf16(svld1_f32(pg, b0_row + n));
         svbfloat16_t vb1 = svreinterpret_bf16(svld1_f32(pg, b1_row + n));
 
-        for (int m = 0; m < ROWS; ++m) {
-          float a_val = a_ptr[m * lda2 + k];
-          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
-          acc0_reg[m] = svbfdot_f32(acc0_reg[m], va, vb0);
-          acc1_reg[m] = svbfdot_f32(acc1_reg[m], va, vb1);
+        if (ROWS >= 1) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k]));
+          acc0_0 = svbfdot_f32(acc0_0, va, vb0);
+          acc1_0 = svbfdot_f32(acc1_0, va, vb1);
+        }
+        if (ROWS >= 2) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k]));
+          acc0_1 = svbfdot_f32(acc0_1, va, vb0);
+          acc1_1 = svbfdot_f32(acc1_1, va, vb1);
+        }
+        if (ROWS >= 3) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k]));
+          acc0_2 = svbfdot_f32(acc0_2, va, vb0);
+          acc1_2 = svbfdot_f32(acc1_2, va, vb1);
+        }
+        if (ROWS >= 4) {
+          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k]));
+          acc0_3 = svbfdot_f32(acc0_3, va, vb0);
+          acc1_3 = svbfdot_f32(acc1_3, va, vb1);
         }
       }
 
       // Store: SiLU(acc0) * acc1 -> bf16
-      for (int m = 0; m < ROWS; ++m) {
-        svfloat32_t vx = acc0_reg[m];
-        svfloat32_t vy = acc1_reg[m];
+      auto silu_mul_store = [&](svfloat32_t vx, svfloat32_t vy, int m) {
         // SiLU: x / (1 + exp(-x))
         svfloat32_t vneg_x = svneg_f32_x(pg, vx);
         svfloat32_t vexp = sve_fexp_u20(pg, vneg_x);
@@ -426,7 +440,12 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
         // convert to bf16 and store
         svbfloat16_t vbf = sve_f32_to_bf16(pg, vresult);
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), vbf);
-      }
+      };
+
+      if (ROWS >= 1) silu_mul_store(acc0_0, acc1_0, 0);
+      if (ROWS >= 2) silu_mul_store(acc0_1, acc1_1, 1);
+      if (ROWS >= 3) silu_mul_store(acc0_2, acc1_2, 2);
+      if (ROWS >= 4) silu_mul_store(acc0_3, acc1_3, 3);
     }
   }
 };
@@ -581,25 +600,25 @@ struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
 
     for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
       svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-      svfloat32_t acc_reg[ROWS];
-      for (int m = 0; m < ROWS; ++m) {
-        acc_reg[m] = svdup_n_f32(0.f);
-      }
+      svfloat32_t acc0 = svdup_n_f32(0.f);
+      svfloat32_t acc1 = svdup_n_f32(0.f);
+      svfloat32_t acc2 = svdup_n_f32(0.f);
+      svfloat32_t acc3 = svdup_n_f32(0.f);
 
       for (int64_t k = 0; k < K2; ++k) {
         const float* b_row = reinterpret_cast<const float*>(B) + k * ldb2;
         svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, b_row + n));
 
-        for (int m = 0; m < ROWS; ++m) {
-          float a_val = a_ptr[m * lda2 + k];
-          svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_val));
-          acc_reg[m] = svbfdot_f32(acc_reg[m], va, vb);
-        }
+        if (ROWS >= 1) acc0 = svbfdot_f32(acc0, svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k])), vb);
+        if (ROWS >= 2) acc1 = svbfdot_f32(acc1, svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k])), vb);
+        if (ROWS >= 3) acc2 = svbfdot_f32(acc2, svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k])), vb);
+        if (ROWS >= 4) acc3 = svbfdot_f32(acc3, svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k])), vb);
       }
 
-      for (int m = 0; m < ROWS; ++m) {
-        svst1_f32(pg, C + m * ldc + n, acc_reg[m]);
-      }
+      if (ROWS >= 1) svst1_f32(pg, C + 0 * ldc + n, acc0);
+      if (ROWS >= 2) svst1_f32(pg, C + 1 * ldc + n, acc1);
+      if (ROWS >= 3) svst1_f32(pg, C + 2 * ldc + n, acc2);
+      if (ROWS >= 4) svst1_f32(pg, C + 3 * ldc + n, acc3);
     }
   }
 };
