@@ -24,6 +24,7 @@ dependencies = [
   "compressed-tensors",
   "datasets",
   "decord; platform_machine == 'x86_64'",
+  "decord2; platform_machine == 'aarch64'",
   "einops",
   "fastapi",
   "gguf",

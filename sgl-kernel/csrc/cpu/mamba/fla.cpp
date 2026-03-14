@@ -1249,7 +1249,8 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   int64_t v_head_dim = v.size(3);
   CHECK_INPUT_SHAPE_DTYPE<true>(k, {seq_len, batch_size, num_heads, head_dim}, q.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<true>(v, {seq_len, batch_size, v_num_heads, v_head_dim}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<true>(A_log, {v_num_heads}, at::kFloat);
+  CHECK_EQ(A_log.size(0), v_num_heads);
+  at::Tensor A_log_float = A_log.to(at::kFloat);
   CHECK_INPUT_SHAPE_DTYPE<true>(a, {batch_size, v_num_heads}, q.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<true>(dt_bias, {v_num_heads}, q.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<true>(b, {batch_size, v_num_heads}, q.scalar_type());
@@ -1276,7 +1277,7 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
         q.data_ptr<scalar_t>(),
         k.data_ptr<scalar_t>(),
         v.data_ptr<scalar_t>(),
-        A_log.data_ptr<float>(),
+        A_log_float.data_ptr<float>(),
         a.data_ptr<scalar_t>(),
         dt_bias.data_ptr<scalar_t>(),
         b.data_ptr<scalar_t>(),
@@ -1320,6 +1321,7 @@ fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Ten
   CHECK_CONTIGUOUS(a);
   CHECK_EQ(A_log.size(0), a.size(1));
   CHECK_EQ(A_log.size(0), dt_bias.size(0));
+  at::Tensor A_log_float = A_log.to(at::kFloat);
   int batch = a.size(0);
   int num_heads = a.size(1);
   CHECK_EQ(b.size(0), batch);
@@ -1328,7 +1330,7 @@ fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Ten
   at::Tensor beta = at::empty({1, batch, num_heads}, b.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(a.scalar_type(), "fused_gdn_gating_kernel", [&] {
     fused_gdn_gating_kernel_impl<scalar_t>(
-        A_log.data_ptr<float>(),
+        A_log_float.data_ptr<float>(),
         a.data_ptr<scalar_t>(),
         b.data_ptr<scalar_t>(),
         dt_bias.data_ptr<scalar_t>(),

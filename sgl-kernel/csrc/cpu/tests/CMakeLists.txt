@@ -14,3 +14,4 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SVE_FLAGS} -O2")
 
 add_executable(test_sve_kernels test_sve_kernels.cpp)
 add_executable(test_sve_highlevel_ops test_sve_highlevel_ops.cpp)
+add_executable(bench_sve_kernels bench_sve_kernels.cpp)
