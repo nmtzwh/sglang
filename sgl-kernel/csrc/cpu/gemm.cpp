@@ -54,6 +54,7 @@ inline void pack_vnni<int8_t>(int8_t* __restrict__ packed, const int8_t* __restr
   constexpr int BLOCK_N = block_size_n();
   TORCH_CHECK(N == BLOCK_N);
 
+#if defined(CPU_CAPABILITY_AVX512)
   const int VNNI_BLK = 4;
   for (int n = 0; n < N; ++n) {
     for (int k = 0; k < K / VNNI_BLK; ++k) {
@@ -63,6 +64,28 @@ inline void pack_vnni<int8_t>(int8_t* __restrict__ packed, const int8_t* __restr
     }
   }
   s8s8_compensation<BLOCK_N>(packed, K);
+#elif defined(CPU_CAPABILITY_SVE)
+  // SVE SMMLA expects 8x2 blocks (16 bytes)
+  const int VNNI_ROW = 8;
+  const int VNNI_COL = 2;
+  for (int n = 0; n < N / VNNI_COL; ++n) {
+    for (int k = 0; k < K / VNNI_ROW; ++k) {
+      for (int r = 0; r < VNNI_ROW; ++r) {
+        for (int c = 0; c < VNNI_COL; ++c) {
+          packed[k * (N/2) * 16 + n * 16 + r * 2 + c] = weight[(n * 2 + c) * K + (k * 8 + r)];
+        }
+      }
+    }
+  }
+  int32_t* comp = reinterpret_cast<int32_t*>(packed + BLOCK_N * K);
+  for (int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (int k = 0; k < K; ++k) {
+      sum += 128 * static_cast<int32_t>(weight[n * K + k]);
+    }
+    comp[n] = sum;
+  }
+#endif
 }
 
 template <typename scalar_t>

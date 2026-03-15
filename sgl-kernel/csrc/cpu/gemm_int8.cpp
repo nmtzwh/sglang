@@ -192,7 +192,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 #endif
 
 #if defined(CPU_CAPABILITY_SVE)
-// SVE VL-agnostic INT8 GEMM micro-kernel using svdot_s32
+// SVE VL-agnostic INT8 GEMM micro-kernel using svusmmla_s32
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -209,34 +209,57 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       int64_t ldc) {
     constexpr int ROWS = BLOCK_M;
     const uint64_t vl_s32 = svcntw();
-
-    // K is in bytes, each dot-product processes 4 bytes
-    const int64_t K4 = K >> 2;
-    const int32_t* a_ptr = reinterpret_cast<const int32_t*>(A);
-    const int64_t lda4 = lda >> 2;
-    const int32_t* b_ptr = reinterpret_cast<const int32_t*>(B);
-    const int64_t ldb4 = ldb;
+    const uint64_t vl_s8 = svcntb();
 
     for (int64_t n = 0; n < BLOCK_N; n += vl_s32) {
-      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-      
-      // Use individual SVE registers to avoid array-of-SVE-types issues
+      uint32_t n_bytes = n * 8;
+      svbool_t pg_b0 = svwhilelt_b8(n_bytes, (uint32_t)(BLOCK_N * 8));
+      svbool_t pg_b1 = svwhilelt_b8(n_bytes + vl_s8, (uint32_t)(BLOCK_N * 8));
+
       svint32_t acc0 = svdup_n_s32(0);
       svint32_t acc1 = svdup_n_s32(0);
       svint32_t acc2 = svdup_n_s32(0);
       svint32_t acc3 = svdup_n_s32(0);
 
-      for (int64_t k = 0; k < K4; ++k) {
-        const int32_t* b_row = b_ptr + k * ldb4;
-        svint8_t vb = svreinterpret_s8(svld1_s32(pg, b_row + n));
-        
-        if (ROWS >= 1) acc0 = svdot_s32(acc0, svreinterpret_s8(svreinterpret_u8(svdup_s32(a_ptr[0 * lda4 + k]))), vb);
-        if (ROWS >= 2) acc1 = svdot_s32(acc1, svreinterpret_s8(svreinterpret_u8(svdup_s32(a_ptr[1 * lda4 + k]))), vb);
-        if (ROWS >= 3) acc2 = svdot_s32(acc2, svreinterpret_s8(svreinterpret_u8(svdup_s32(a_ptr[2 * lda4 + k]))), vb);
-        if (ROWS >= 4) acc3 = svdot_s32(acc3, svreinterpret_s8(svreinterpret_u8(svdup_s32(a_ptr[3 * lda4 + k]))), vb);
+      for (int64_t k = 0; k < K; k += 8) {
+        int64_t k_idx = k / 8;
+        const int8_t* b_ptr_k = B + k_idx * (BLOCK_N * 8) + n_bytes;
+        svint8_t vb0 = svld1_s8(pg_b0, b_ptr_k);
+        svint8_t vb1 = svld1_s8(pg_b1, b_ptr_k + vl_s8);
+
+        if (ROWS >= 1) {
+          uint64_t a0 = *reinterpret_cast<const uint64_t*>(A + 0 * lda + k);
+          svuint8_t va0;
+          if (ROWS >= 2) {
+            uint64_t a1 = *reinterpret_cast<const uint64_t*>(A + 1 * lda + k);
+            va0 = svreinterpret_u8_u64(svzip1_u64(svdup_n_u64(a0), svdup_n_u64(a1)));
+          } else {
+            va0 = svreinterpret_u8_u64(svdup_n_u64(a0));
+          }
+          acc0 = svusmmla_s32(acc0, va0, vb0);
+          acc1 = svusmmla_s32(acc1, va0, vb1);
+        }
+
+        if (ROWS >= 3) {
+          uint64_t a2 = *reinterpret_cast<const uint64_t*>(A + 2 * lda + k);
+          svuint8_t va1;
+          if (ROWS >= 4) {
+            uint64_t a3 = *reinterpret_cast<const uint64_t*>(A + 3 * lda + k);
+            va1 = svreinterpret_u8_u64(svzip1_u64(svdup_n_u64(a2), svdup_n_u64(a3)));
+          } else {
+            va1 = svreinterpret_u8_u64(svdup_n_u64(a2));
+          }
+          acc2 = svusmmla_s32(acc2, va1, vb0);
+          acc3 = svusmmla_s32(acc3, va1, vb1);
+        }
       }
 
-      // Dequantize: (acc - Bcomp) * As * Bs + bias
+      svint32_t c0 = svreinterpret_s32_s64(svuzp1_s64(svreinterpret_s64_s32(acc0), svreinterpret_s64_s32(acc1)));
+      svint32_t c1 = svreinterpret_s32_s64(svuzp2_s64(svreinterpret_s64_s32(acc0), svreinterpret_s64_s32(acc1)));
+      svint32_t c2 = svreinterpret_s32_s64(svuzp1_s64(svreinterpret_s64_s32(acc2), svreinterpret_s64_s32(acc3)));
+      svint32_t c3 = svreinterpret_s32_s64(svuzp2_s64(svreinterpret_s64_s32(acc2), svreinterpret_s64_s32(acc3)));
+
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
       svint32_t vcomp = svld1_s32(pg, Bcomp + n);
       svfloat32_t vbs = svld1_f32(pg, Bs + n);
       svfloat32_t vbias;
@@ -251,10 +274,10 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
         svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + m * ldc + n), sve_f32_to_bf16(pg, vf));
       };
 
-      if (ROWS >= 1) dequant_and_store(acc0, 0);
-      if (ROWS >= 2) dequant_and_store(acc1, 1);
-      if (ROWS >= 3) dequant_and_store(acc2, 2);
-      if (ROWS >= 4) dequant_and_store(acc3, 3);
+      if (ROWS >= 1) dequant_and_store(c0, 0);
+      if (ROWS >= 2) dequant_and_store(c1, 1);
+      if (ROWS >= 3) dequant_and_store(c2, 2);
+      if (ROWS >= 4) dequant_and_store(c3, 3);
     }
   }
 };
