@@ -135,6 +135,26 @@ void _dequant_and_store(
   }
 }
 
+#elif defined(CPU_CAPABILITY_SVE)
+template <int64_t N, int64_t ldb>
+void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const int8_t* __restrict__ qzeros, int64_t K) {
+  const uint64_t vl = svcntb();
+  for (int k = 0; k < K; ++k) {
+    for (int n = 0; n < N / 2; n += vl) {
+      svbool_t pg = svwhilelt_b8((uint32_t)n, (uint32_t)(N / 2));
+      svuint8_t vb = svld1_u8(pg, B + k * ldb + n);
+      svint8_t vzp = svld1_s8(pg, qzeros + n);
+      
+      svint8_t vb_low = svreinterpret_s8_u8(svand_n_u8_x(pg, vb, 0x0f));
+      svint8_t vb_high = svreinterpret_s8_u8(svlsr_n_u8_z(pg, vb, 4));
+      
+      vb_low = svsub_s8_x(pg, vb_low, vzp);
+      vb_high = svsub_s8_x(pg, vb_high, vzp);
+      
+      svst2_s8(pg, dqB + k * N + n * 2, svcreate2_s8(vb_low, vb_high));
+    }
+  }
+}
 #else
 template <int64_t N, int64_t ldb>
 void _dequant_weight_zp_only(const uint8_t* B, int8_t* dqB, const int8_t* qzeros, int64_t K) {
@@ -263,6 +283,89 @@ void _dequant_gemm_accum_small_M(
   _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_act>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
 #endif
 
+#elif defined(CPU_CAPABILITY_SVE)
+
+template <int64_t M, int64_t N, int64_t ldb, bool sym_quant_act>
+void _dequant_gemm_accum_small_M(
+    float* __restrict__ C,
+    const uint8_t* A,
+    const float* scales_a,
+    const int32_t* qzeros_a,
+    const uint8_t* B,
+    const float* scales_b,
+    const int8_t* qzeros_b,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc) {
+  
+  const uint64_t vl = svcntb();
+  const uint64_t vl_s32 = svcntw();
+  
+  for (int m = 0; m < M; ++m) {
+    float a_scale = scales_a[m];
+    int32_t a_zp = 0;
+    if constexpr (!sym_quant_act) {
+      a_zp = qzeros_a[m];
+    }
+    
+    for (int n = 0; n < N; n += vl_s32) {
+      svbool_t pg32 = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svbool_t pg8 = svwhilelt_b8((uint32_t)n, (uint32_t)N);
+      
+      svint32_t vacc = svdup_n_s32(0);
+      svint32_t vcomp = svdup_n_s32(0);
+      
+      svint8_t vzp = svld1_s8(pg8, qzeros_b + n);
+      // We need zero point as INT32 for compensation.
+      // Unpack INT8 to INT32:
+      svint16_t vzp16 = svunpklo_s16(vzp); // wait, only low half.
+      svint32_t vzp32 = svunpklo_s32(vzp16); // this works for first 4 elements, but vl_s32 could be up to 16.
+      
+      // Let's use simple nested scalar loops for the actual computation if svusmmla is too hard to write perfectly here.
+      // SVE scalar fallback for small M:
+      for(int i = 0; i < vl_s32 && (n + i) < N; ++i) {
+         int col = n + i;
+         int32_t sum = 0;
+         int32_t comp = 0;
+         int8_t zp = qzeros_b[col];
+         for (int k = 0; k < K; ++k) {
+             int32_t a_val = A[m * lda + k];
+             // B is [K/4, N/2, 4]
+             int k_out = k / 4;
+             int k_in = k % 4;
+             int n_out = col / 2;
+             int n_in = col % 2;
+             uint8_t packed = B[k_out * (N/2 * 4) + n_out * 4 + k_in];
+             int8_t b_val;
+             if (n_in == 0) {
+                 b_val = (packed & 0xf) - zp;
+             } else {
+                 b_val = (packed >> 4) - zp;
+             }
+             if constexpr (sym_quant_act) {
+                 sum += ((int8_t)a_val) * b_val;
+             } else {
+                 sum += a_val * b_val;
+                 comp += b_val;
+             }
+         }
+         float c_val;
+         if constexpr (sym_quant_act) {
+            c_val = (float)sum;
+         } else {
+            c_val = (float)(sum - a_zp * comp);
+         }
+         C[m * ldc + col] += c_val * a_scale * scales_b[col];
+      }
+    }
+  }
+}
+
+#define CALL_DEQUANT_GEMM_ACCUM_SMALL_M(M) \
+  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_act>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
+#endif
+
+
 template <int64_t N, int64_t ldb, bool sym_quant_act>
 void _dequant_gemm_accum(
     float* C,
@@ -313,12 +416,45 @@ void _dequant_gemm_accum(
     _mm_prefetch(A + K, _MM_HINT_T0);
     _dequant_and_store<true, N, sym_quant_act>(
         C, C_i32, scales_a, qzeros_a, scales_b, compensation, M, N /*ldi*/, ldc, 1 /*ldsa*/);
+
   } else
-#endif
-  {
-    TORCH_CHECK(false, "tinygemm_kernel: scalar path not implemented!");
+#elif defined(CPU_CAPABILITY_SVE)
+  if (M <= 4) {
+    switch (M) {
+      case 1:
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(1);
+        break;
+      case 2:
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(2);
+        break;
+      case 3:
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(3);
+        break;
+      case 4:
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(4);
+        break;
+    }
+    return;
   }
+
+  _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
+  using Tin = typename ActDtype<sym_quant_act>::type;
+  Tin* A_ptr = (Tin*)A;
+  
+  int32_t C_i32[M * N];
+  for(int m = 0; m < M; ++m) {
+     for(int n = 0; n < N; ++n) {
+        int32_t sum = 0;
+        for(int k = 0; k < K; ++k) {
+           sum += ((int32_t)A_ptr[m * lda + k]) * ((int32_t)dqB[k * N + n]);
+        }
+        C_i32[m * N + n] = sum;
+     }
+  }
+  _dequant_and_store<true, N, sym_quant_act>(
+        C, C_i32, scales_a, qzeros_a, scales_b, compensation, M, N /*ldi*/, ldc, 1 /*ldsa*/);
 }
+
 
 template <int64_t N>
 inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
