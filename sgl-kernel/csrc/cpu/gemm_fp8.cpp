@@ -96,17 +96,28 @@ inline void unpack_B(
     _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 32, (__m512i)bf16_1);
   }
 #elif defined(CPU_CAPABILITY_SVE)
-  // SVE fallback: scalar FP8->BF16 unpack
   const int K2 = K >> 1;
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(packed_B);
+  const uint64_t vl_f16 = svcnth();
+  svfloat32_t vscale = svdup_f32(scale);
+
   for (int k = 0; k < K2; ++k) {
-    for (int n = 0; n < N; ++n) {
-      // FP8 e4m3 -> float -> bf16
-      float val0 = static_cast<float>(packed_B[k * 2 * N + n * 2]);
-      float val1 = static_cast<float>(packed_B[k * 2 * N + n * 2 + 1]);
-      val0 *= scale;
-      val1 *= scale;
-      Btmp[k * ldb_tmp * 2 + n * 2] = static_cast<at::BFloat16>(val0);
-      Btmp[k * ldb_tmp * 2 + n * 2 + 1] = static_cast<at::BFloat16>(val1);
+    for (int n = 0; n < N * 2; n += vl_f16) {
+      svbool_t pg_load = svwhilelt_b8(0u, (uint32_t)(std::min((uint64_t)(N * 2 - n), vl_f16)));
+      svuint8_t v_fp8 = svld1_u8(pg_load, b_ptr + k * 2 * N + n);
+      svbfloat16_t v_bf16 = SVE_CVT_FP8_TO_BF16(v_fp8);
+      
+      svfloat32_t v_f32_lo = sve_cvt_bf16_to_fp32_low(v_bf16);
+      svfloat32_t v_f32_hi = sve_cvt_bf16_to_fp32_high(v_bf16);
+      
+      svbool_t pg_f32 = svptrue_b32();
+      v_f32_lo = svmul_f32_x(pg_f32, v_f32_lo, vscale);
+      v_f32_hi = svmul_f32_x(pg_f32, v_f32_hi, vscale);
+      
+      svbfloat16_t v_bf16_scaled = sve_cvt_fp32_to_bf16(v_f32_lo, v_f32_hi);
+      
+      svbool_t pg_store = svwhilelt_b16((uint32_t)n, (uint32_t)(N * 2));
+      svst1_bf16(pg_store, reinterpret_cast<bfloat16_t*>(Btmp + k * ldb_tmp * 2 + n), v_bf16_scaled);
     }
   }
 #else
@@ -289,7 +300,9 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
         svfloat32_t bacc3 = svdup_n_f32(0.f);
 
         for (int k = kb_start; k < kb_end; ++k) {
-          svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(b_ptr) + k * ldb + n));
+          svbool_t pg8 = svwhilelt_b8(0u, (uint32_t)((BLOCK_N - n) * 2));
+          svuint8_t v_fp8 = svld1_u8(pg8, b_ptr + k * ldb * 2 + n * 2);
+          svbfloat16_t vb = SVE_CVT_FP8_TO_BF16(v_fp8);
           if (ROWS >= 1) bacc0 = svbfdot_f32(bacc0, svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k])), vb);
           if (ROWS >= 2) bacc1 = svbfdot_f32(bacc1, svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k])), vb);
           if (ROWS >= 3) bacc2 = svbfdot_f32(bacc2, svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k])), vb);

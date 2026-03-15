@@ -530,6 +530,229 @@ void test_gemm_accumulate() {
 }
 
 // ============================================================================
+
+// ============================================================================
+// SVE FP8->BF16 conversion logic (ported from vec.h)
+// ============================================================================
+inline svbfloat16_t sve_cvt_e4m3_bf16_test(svuint8_t fp8_vec) {
+  const svbool_t pg16 = svptrue_b16();
+  svuint16_t x = svunpklo_u16(fp8_vec);
+  svuint16_t vsign = svand_u16_x(pg16, x, svdup_u16(0x80));
+  vsign = svlsl_n_u16_x(pg16, vsign, 8);
+  svuint16_t vexp_and_mant = svand_u16_x(pg16, x, svdup_u16(0x7F));
+  vexp_and_mant = svlsl_n_u16_x(pg16, vexp_and_mant, 4);
+  svuint16_t result = svorr_u16_x(pg16, vsign, svdup_u16(0x4000));
+  result = svorr_u16_x(pg16, result, vexp_and_mant);
+  return svreinterpret_bf16(result);
+}
+
+// ============================================================================
+// Test 12: FP8 GEMM (bf16 A @ e4m3fn B -> fp32 C)
+// ============================================================================
+void test_gemm_fp8() {
+  printf("[TEST] FP8 GEMM (bf16 A @ e4m3fn B -> fp32 C)\n");
+  const int M = 2, N = 4, K = 4;
+
+  float A_f32[M * K] = {1, 0, 0, 0, 0, 1, 0, 0};
+  uint8_t B_fp8[K * N] = {
+    0x38, 0x40, 0x38, 0x40, 
+    0x00, 0x00, 0x00, 0x00, 
+    0x00, 0x00, 0x00, 0x00, 
+    0x00, 0x00, 0x00, 0x00
+  };
+
+  alignas(64) bfloat16_t A_bf16[M * K];
+  store_bf16_from_f32(A_f32, A_bf16, M * K);
+
+  alignas(64) uint8_t B_vnni[K / 2 * N * 2];
+  for (int k2 = 0; k2 < K / 2; k2++) {
+    for (int n = 0; n < N; n++) {
+      B_vnni[k2 * N * 2 + n * 2 + 0] = B_fp8[(k2 * 2 + 0) * N + n];
+      B_vnni[k2 * N * 2 + n * 2 + 1] = B_fp8[(k2 * 2 + 1) * N + n];
+    }
+  }
+
+  alignas(64) float C[M * N] = {};
+
+  const uint64_t vl_f32 = svcntw();
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vc = svdup_f32(0.f);
+      for (int k = 0; k < K / 2; ++k) {
+        float a_pair;
+        std::memcpy(&a_pair, reinterpret_cast<const char*>(A_bf16 + m * K + k * 2), sizeof(float));
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_pair));
+        
+        svbool_t pg8 = svwhilelt_b8(0u, (uint32_t)((N - n) * 2));
+        svuint8_t v_fp8 = svld1_u8(pg8, B_vnni + k * N * 2 + n * 2);
+        svbfloat16_t vb = sve_cvt_e4m3_bf16_test(v_fp8);
+        
+        // Scale
+        svuint16_t vu16 = svreinterpret_u16(vb);
+        svuint32_t vu32_lo = svunpklo_u32(vu16);
+        svuint32_t vu32_hi = svunpkhi_u32(vu16);
+        vu32_lo = svlsl_n_u32_x(svptrue_b32(), vu32_lo, 16);
+        vu32_hi = svlsl_n_u32_x(svptrue_b32(), vu32_hi, 16);
+        svfloat32_t vf_lo = svreinterpret_f32(vu32_lo);
+        svfloat32_t vf_hi = svreinterpret_f32(vu32_hi);
+        
+        vf_lo = svmul_f32_x(svptrue_b32(), vf_lo, svdup_f32(1.0f / 256.0f));
+        vf_hi = svmul_f32_x(svptrue_b32(), vf_hi, svdup_f32(1.0f / 256.0f));
+        
+        vu32_lo = svreinterpret_u32(vf_lo);
+        vu32_hi = svreinterpret_u32(vf_hi);
+        svuint16_t vu16_lo = svreinterpret_u16(svlsr_n_u32_x(svptrue_b32(), vu32_lo, 16));
+        svuint16_t vu16_hi = svreinterpret_u16(svlsr_n_u32_x(svptrue_b32(), vu32_hi, 16));
+        vb = svreinterpret_bf16(svuzp1_u16(vu16_lo, vu16_hi));
+
+        vc = svbfdot_f32(vc, va, vb);
+      }
+      svst1_f32(pg, C + m * N + n, vc);
+    }
+  }
+
+  float expected[M * N] = {1, 2, 1, 2, 0, 0, 0, 0};
+  for (int i = 0; i < M * N; i++) {
+    TEST_ASSERT_NEAR(C[i], expected[i], 0.5f, "fp8 gemm");
+  }
+}
+
+// ============================================================================
+// Test 13: INT8 GEMM (uint8 A @ int8 B -> int32 C)
+// ============================================================================
+void test_gemm_int8() {
+  printf("[TEST] INT8 GEMM (uint8 A @ int8 B -> int32 C)\n");
+  const int M = 2, N = 4, K = 4;
+  
+  uint8_t A[M * K] = {1, 2, 3, 4, 5, 6, 7, 8};
+  int8_t B[K * N] = {
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1
+  };
+  
+  // Pack B to VNNI layout [K/4, N, 4]
+  alignas(64) int8_t B_vnni[K / 4 * N * 4];
+  for (int k4 = 0; k4 < K / 4; k4++) {
+    for (int n = 0; n < N; n++) {
+      B_vnni[k4 * N * 4 + n * 4 + 0] = B[(k4 * 4 + 0) * N + n];
+      B_vnni[k4 * N * 4 + n * 4 + 1] = B[(k4 * 4 + 1) * N + n];
+      B_vnni[k4 * N * 4 + n * 4 + 2] = B[(k4 * 4 + 2) * N + n];
+      B_vnni[k4 * N * 4 + n * 4 + 3] = B[(k4 * 4 + 3) * N + n];
+    }
+  }
+  
+  alignas(64) int32_t C[M * N] = {};
+  
+  const uint64_t vl_i32 = svcntw();
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_i32) {
+      svbool_t pg32 = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svbool_t pg8 = svwhilelt_b8(0u, (uint32_t)((N - n) * 4));
+      svint32_t vc = svdup_s32(0);
+      for (int k = 0; k < K / 4; ++k) {
+        uint32_t a_quad;
+        std::memcpy(&a_quad, A + m * K + k * 4, 4);
+        svuint8_t va = svreinterpret_u8(svdup_u32(a_quad));
+        svint8_t vb = svld1_s8(pg8, B_vnni + k * N * 4 + n * 4);
+        vc = svusdot_s32(vc, va, vb);
+      }
+      svst1_s32(pg32, C + m * N + n, vc);
+    }
+  }
+  
+  int32_t expected[M * N] = {1, 2, 3, 4, 5, 6, 7, 8};
+  for (int i = 0; i < M * N; i++) {
+    TEST_ASSERT(C[i] == expected[i], "int8 gemm");
+  }
+}
+
+// ============================================================================
+// Test 14: INT4 GEMM (bf16 A @ int4 B -> fp32 C)
+// ============================================================================
+void test_gemm_int4() {
+  printf("[TEST] INT4 GEMM (bf16 A @ int4 B -> fp32 C)\n");
+  const int M = 2, N = 8, K = 4;
+  
+  float A_f32[M * K] = {1, 0, 0, 0, 0, 1, 0, 0};
+  
+  // Pack 2 INT4 elements into 1 INT8
+  uint8_t B_int4[K * N / 2];
+  for (int k = 0; k < K; ++k) {
+    for (int n = 0; n < N / 2; ++n) {
+      uint8_t low = 2; // value 2
+      uint8_t high = 3; // value 3
+      B_int4[k * (N / 2) + n] = (high << 4) | (low & 0x0F);
+    }
+  }
+  
+  alignas(64) bfloat16_t A_bf16[M * K];
+  store_bf16_from_f32(A_f32, A_bf16, M * K);
+  
+  alignas(64) int8_t qzeros[N / 2] = {0, 0, 0, 0};
+  alignas(64) int8_t dqB[K * N];
+  
+  // Dequantize INT4 to INT8
+  const uint64_t vl = svcntb();
+  for (int k = 0; k < K; ++k) {
+    for (int n = 0; n < N / 2; n += vl) {
+      svbool_t pg = svwhilelt_b8((uint32_t)n, (uint32_t)(N / 2));
+      svuint8_t vb = svld1_u8(pg, B_int4 + k * (N / 2) + n);
+      svint8_t vzp = svld1_s8(pg, qzeros + n);
+      
+      svint8_t vb_low = svreinterpret_s8_u8(svand_n_u8_x(pg, vb, 0x0f));
+      svint8_t vb_high = svreinterpret_s8_u8(svlsr_n_u8_z(pg, vb, 4));
+      
+      vb_low = svsub_s8_x(pg, vb_low, vzp);
+      vb_high = svsub_s8_x(pg, vb_high, vzp);
+      
+      svint8x2_t v_dq = svcreate2_s8(vb_low, vb_high);
+      svst2_s8(pg, dqB + k * N + n * 2, v_dq);
+    }
+  }
+  
+  // Pack dqB (INT8) to VNNI layout [K/2, N, 2] as BF16 (for bfdot)
+  // Or just simple bf16 gemm for testing INT4 unpacking.
+  // We'll convert INT8 to BF16 for dot product
+  alignas(64) bfloat16_t B_vnni[K / 2 * N * 2];
+  for (int k2 = 0; k2 < K / 2; k2++) {
+    for (int n = 0; n < N; n++) {
+      bf16_t v0((float)dqB[(k2 * 2 + 0) * N + n]);
+      bf16_t v1((float)dqB[(k2 * 2 + 1) * N + n]);
+      std::memcpy(&B_vnni[k2 * N * 2 + n * 2 + 0], &v0.val, 2);
+      std::memcpy(&B_vnni[k2 * N * 2 + n * 2 + 1], &v1.val, 2);
+    }
+  }
+  
+  alignas(64) float C[M * N] = {};
+
+  const uint64_t vl_f32 = svcntw();
+  for (int m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; n += vl_f32) {
+      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)N);
+      svfloat32_t vc = svdup_f32(0.f);
+      for (int k = 0; k < K / 2; ++k) {
+        float a_pair;
+        std::memcpy(&a_pair, reinterpret_cast<const char*>(A_bf16 + m * K + k * 2), sizeof(float));
+        svbfloat16_t va = svreinterpret_bf16(svdup_f32(a_pair));
+        svbfloat16_t vb = svreinterpret_bf16(svld1_f32(pg, reinterpret_cast<const float*>(B_vnni) + k * N + n));
+        vc = svbfdot_f32(vc, va, vb);
+      }
+      svst1_f32(pg, C + m * N + n, vc);
+    }
+  }
+  
+  // A is identity for first K. M=2, N=8, K=4. Row 0 is [1, 0, 0, 0] -> selects K=0
+  // B at K=0 has values 2, 3, 2, 3...
+  float expected[M * N] = {2, 3, 2, 3, 2, 3, 2, 3,  // M=0 -> K=0
+                           2, 3, 2, 3, 2, 3, 2, 3}; // M=1 -> K=1
+  for (int i = 0; i < M * N; i++) {
+    TEST_ASSERT_NEAR(C[i], expected[i], 0.5f, "int4 gemm");
+  }
+}
+
 int main() {
   printf("=== SVE Functional Tests ===\n");
   printf("SVE vector length: %lu bits (%lu x fp32)\n", svcntw() * 32, svcntw());
@@ -546,6 +769,9 @@ int main() {
   test_silu();
   test_vl_agnostic_loop();
   test_gemm_accumulate();
+  test_gemm_fp8();
+  test_gemm_int8();
+  test_gemm_int4();
 
   printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
   return g_fail > 0 ? 1 : 0;
