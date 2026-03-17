@@ -126,17 +126,17 @@ void _dequant_and_store(
 #elif defined(CPU_CAPABILITY_SVE)
 template <int64_t N, int64_t ldb>
 void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const int8_t* __restrict__ qzeros, int64_t K) {
-  const uint64_t vl = svcntb();
   for (int k = 0; k < K; ++k) {
-    for (int n = 0; n < N / 2; n += vl) {
-      svbool_t pg = svwhilelt_b8((uint64_t)n, (uint64_t)(N / 2));
-      svuint8_t vb = svld1_u8(pg, B + k * ldb + n);
-      svint8_t vzp = svld1_s8(pg, qzeros + n);
-      svint8_t vb_low = svreinterpret_s8_u8(svand_n_u8_x(pg, vb, 0x0f));
-      svint8_t vb_high = svreinterpret_s8_u8(svlsr_n_u8_z(pg, vb, 4));
-      vb_low = svsub_s8_x(pg, vb_low, vzp);
-      vb_high = svsub_s8_x(pg, vb_high, vzp);
-      svst2_s8(pg, dqB + k * N + n * 2, svcreate2_s8(vb_low, vb_high));
+    for (int col = 0; col < N; ++col) {
+      int k_out = k / 4;
+      int k_in = k % 4;
+      int n_out = (col / 16) * 8 + (col % 8);
+      int n_in = (col / 8) % 2;
+      uint8_t packed = B[k_out * (N * 2) + n_out * 4 + k_in];
+      int8_t b_val;
+      if (n_in == 0) b_val = (packed & 0xf) - qzeros[col];
+      else b_val = (packed >> 4) - qzeros[col];
+      dqB[k * N + col] = b_val;
     }
   }
 }
@@ -179,10 +179,16 @@ void _dequant_and_store(
 template <int64_t N, int64_t ldb>
 void _dequant_weight_zp_only(const uint8_t* B, int8_t* dqB, const int8_t* qzeros, int64_t K) {
   for (int k = 0; k < K; ++k) {
-    for (int n = 0; n < N / 2; ++n) {
-      int32_t b = (int32_t)B[k * ldb + n];
-      dqB[k * N + n * 2] = (b & 0xf) - qzeros[n];
-      dqB[k * N + n * 2 + 1] = (b >> 4) - qzeros[n];
+    for (int col = 0; col < N; ++col) {
+      int k_out = k / 4;
+      int k_in = k % 4;
+      int n_out = (col / 16) * 8 + (col % 8);
+      int n_in = (col / 8) % 2;
+      uint8_t packed = B[k_out * (N * 2) + n_out * 4 + k_in];
+      int8_t b_val;
+      if (n_in == 0) b_val = (packed & 0xf) - qzeros[col];
+      else b_val = (packed >> 4) - qzeros[col];
+      dqB[k * N + col] = b_val;
     }
   }
 }
@@ -351,9 +357,9 @@ void _dequant_gemm_accum_small_M(
              int32_t a_val = A[m * lda + k];
              int k_out = k / 4;
              int k_in = k % 4;
-             int n_out = col / 2;
-             int n_in = col % 2;
-             uint8_t packed = B[k_out * (N/2 * 4) + n_out * 4 + k_in];
+             int n_out = (col / 16) * 8 + (col % 8);
+             int n_in = (col / 8) % 2;
+             uint8_t packed = B[k_out * (N * 2) + n_out * 4 + k_in];
              int8_t b_val;
              if (n_in == 0) b_val = (packed & 0xf) - zp;
              else b_val = (packed >> 4) - zp;
@@ -396,9 +402,9 @@ void _dequant_gemm_accum_small_M(
              int32_t a_val = A[m * lda + k];
              int k_out = k / 4;
              int k_in = k % 4;
-             int n_out = col / 2;
-             int n_in = col % 2;
-             uint8_t packed = B[k_out * (N/2 * 4) + n_out * 4 + k_in];
+             int n_out = (col / 16) * 8 + (col % 8);
+             int n_in = (col / 8) % 2;
+             uint8_t packed = B[k_out * (N * 2) + n_out * 4 + k_in];
              int8_t b_val;
              if (n_in == 0) b_val = (packed & 0xf) - zp;
              else b_val = (packed >> 4) - zp;

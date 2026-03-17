@@ -245,8 +245,8 @@ class TestGemm(CustomTestCase):
             bias = None
         x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
         ref_res = torch.nn.functional.linear(
-            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
-        )
+            x.float(), bf16_weight.float(), bias=bias.to(torch.float) if has_bias else None
+        ).to(torch.bfloat16)
 
         packed_weight, packed_zero, packed_scales = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(

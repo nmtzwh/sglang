@@ -445,10 +445,12 @@ inline void quantize_row_int8<at::BFloat16>(
     vf = svrintn_f32_x(pg, vf);  // round to nearest
     vf = svadd_f32_x(pg, vf, voff);
     svint32_t vi = svcvt_s32_f32_x(pg, vf);
-    // Narrow to uint8 and store
-    svuint16_t vn16 = svqxtunb_s32(vi);
-    svuint8_t vn8 = svqxtunb_s16(svreinterpret_s16(vn16));
-    svst1b_u32(pg, Aq + k, svreinterpret_u32(svunpklo_u16(vn8)));
+    int32_t tmp[16];
+    svst1_s32(pg, tmp, vi);
+    int valid = std::min((int64_t)vl, K - k);
+    for (int i = 0; i < valid; ++i) {
+      Aq[k + i] = (uint8_t)std::max(0, std::min(255, tmp[i]));
+    }
   }
   As = scale;
 }
