@@ -409,29 +409,39 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       }
 
       // Store results
+      auto get_pb = [&](int idx) {
+        uint64_t start = n + idx * vl_f32;
+        uint64_t count = start < BLOCK_N ? std::min((uint64_t)vl_f32, (uint64_t)BLOCK_N - start) : 0;
+        return svwhilelt_b16((uint32_t)0, (uint32_t)count);
+      };
+      svbool_t pb0 = get_pb(0);
+      svbool_t pb1 = get_pb(1);
+      svbool_t pb2 = get_pb(2);
+      svbool_t pb3 = get_pb(3);
+
       if (ROWS >= 1) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc00));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc01));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc02));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc03));
+        svst1_bf16(pb0, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc00));
+        svst1_bf16(pb1, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc01));
+        svst1_bf16(pb2, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc02));
+        svst1_bf16(pb3, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc03));
       }
       if (ROWS >= 2) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc10));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc11));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc12));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc13));
+        svst1_bf16(pb0, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc10));
+        svst1_bf16(pb1, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc11));
+        svst1_bf16(pb2, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc12));
+        svst1_bf16(pb3, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc13));
       }
       if (ROWS >= 3) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc20));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc21));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc22));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc23));
+        svst1_bf16(pb0, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc20));
+        svst1_bf16(pb1, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc21));
+        svst1_bf16(pb2, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc22));
+        svst1_bf16(pb3, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc23));
       }
       if (ROWS >= 4) {
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 0 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc30));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 1 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc31));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 2 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc32));
-        svst1_bf16(svwhilelt_b16((uint32_t)(n + 3 * vl_f32), (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc33));
+        svst1_bf16(pb0, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 0 * vl_f32), sve_f32_to_bf16(pg0, acc30));
+        svst1_bf16(pb1, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 1 * vl_f32), sve_f32_to_bf16(pg1, acc31));
+        svst1_bf16(pb2, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 2 * vl_f32), sve_f32_to_bf16(pg2, acc32));
+        svst1_bf16(pb3, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n + 3 * vl_f32), sve_f32_to_bf16(pg3, acc33));
       }
     }
   }
@@ -631,9 +641,9 @@ void weight_packed_linear_kernel_impl(
       
       // Locality optimization: Pack A for large M
       const bool should_pack_a = (M > 16) && !use_brgemm;
-      const int64_t rows_a = (mb1 - mb0) * BLOCK_M;
+      const int64_t rows_a = std::max<int64_t>(0, mb1 - mb0) * BLOCK_M;
       std::vector<scalar_t> a_packed_vec;
-      if (should_pack_a) {
+      if (should_pack_a && rows_a > 0) {
           a_packed_vec.resize(rows_a * K);
           scalar_t* a_packed_ptr = a_packed_vec.data();
           for (int64_t i = 0; i < rows_a; ++i) {
@@ -708,7 +718,7 @@ void weight_packed_linear_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(N - nb_start, BLOCK_N);
         for (int64_t m = 0; m < mb_size; ++m) {
-          copy_stub<scalar_t>(Atmp + m * K, mat1 + mb_start * mat1_strideM + m * K, K);
+          copy_stub<scalar_t>(Atmp + m * K, mat1 + (mb_start + m) * mat1_strideM, K);
         }
         tinygemm_kernel<scalar_t, has_bias>(
             /*   A */ Atmp,
