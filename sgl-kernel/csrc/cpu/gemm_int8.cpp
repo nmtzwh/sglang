@@ -211,7 +211,12 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       for (int n = 0; n < BLOCK_N; ++n) {
         int32_t sum = 0;
         for (int k = 0; k < K; ++k) {
-          sum += ((int32_t)A[m * lda + k]) * ((int32_t)B[n * K + k]);
+          int n_outer = n / 2;
+          int c = n % 2;
+          int k_outer = k / 8;
+          int r = k % 8;
+          int packed_idx = k_outer * (BLOCK_N / 2) * 16 + n_outer * 16 + r * 2 + c;
+          sum += ((int32_t)A[m * lda + k]) * ((int32_t)B[packed_idx]);
         }
         float res = (float)(sum - Bcomp[n]) * a_scale * Bs[n];
         if constexpr (has_bias) {
