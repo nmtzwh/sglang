@@ -60,6 +60,34 @@ def torch_gptq_gemm(
     return c
 
 
+def gptq_to_awq(q_weight, q_zeros, bit):
+    assert bit == 4
+    K_pack, N = q_weight.shape
+    K = K_pack * 8
+    num_groups, N_pack = q_zeros.shape
+    assert N_pack * 8 == N
+
+    unpacked_q_weight = torch.zeros(K, N, dtype=torch.int32, device=q_weight.device)
+    for i in range(8):
+        unpacked_q_weight[i::8, :] = (q_weight >> (i * 4)) & 0x0F
+
+    unpacked_q_zeros = torch.zeros(num_groups, N, dtype=torch.int32, device=q_zeros.device)
+    for i in range(8):
+        unpacked_q_zeros[:, i::8] = (q_zeros >> (i * 4)) & 0x0F
+    
+    unpacked_q_zeros += 1 # GPTQ specific +1 for zeros
+
+    awq_q_weight = torch.zeros(K, N // 8, dtype=torch.int32, device=q_weight.device)
+    awq_q_zeros = torch.zeros(num_groups, N // 8, dtype=torch.int32, device=q_zeros.device)
+    
+    shifts = [0, 16, 4, 20, 8, 24, 12, 28]
+    for i in range(8):
+        awq_q_weight |= (unpacked_q_weight[:, i::8] & 0xF) << shifts[i]
+        awq_q_zeros |= (unpacked_q_zeros[:, i::8] & 0xF) << shifts[i]
+        
+    return awq_q_weight, awq_q_zeros
+
+
 def _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device="cuda"):
 
     b_fp = torch.randn(K, N, dtype=dtype, device=device)
@@ -102,9 +130,18 @@ def _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device="c
     c_ref = torch_gptq_gemm(
         a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_shuffle, bit
     )
-    c_out = gptq_gemm(
-        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_shuffle, bit
-    )
+    if device == "cpu":
+        awq_weight, awq_zero = gptq_to_awq(b_q_weight, b_gptq_qzeros, bit)
+        packed_weight, packed_zero, packed_scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            awq_weight, awq_zero, b_gptq_scales
+        )
+        c_out = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            a, packed_weight, packed_zero, packed_scales, None
+        )
+    else:
+        c_out = gptq_gemm(
+            a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_shuffle, bit
+        )
 
     rtol = 4e-2
     atol = 4e-2
@@ -121,10 +158,11 @@ def _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device="c
 @pytest.mark.parametrize("group_size", [128])
 @pytest.mark.parametrize("use_shuffle", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
-def test_gptq_gemm(M, N, K, bit, group_size, use_shuffle, dtype):
-    if not torch.cuda.is_available():
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_gptq_gemm(M, N, K, bit, group_size, use_shuffle, dtype, device):
+    if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, "cuda")
+    _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device)
 
 
 if __name__ == "__main__":
