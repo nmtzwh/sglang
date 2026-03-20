@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs, is_cpu
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -72,6 +72,11 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    import sgl_kernel
 
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
@@ -558,12 +563,53 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.register_parameter("qzeros", qzeros)
         layer.register_parameter("scales", scales)
 
+    def _process_weights_for_cpu(self, layer: torch.nn.Module) -> None:
+        assert self.quant_config.weight_bits == 4, "CPU GPTQ only supports 4-bit"
+        K_pack, N = layer.qweight.shape
+        K = K_pack * 8
+        num_groups, N_pack = layer.qzeros.shape
+        assert N_pack * 8 == N
+
+        q_weight = layer.qweight.data
+        q_zeros = layer.qzeros.data
+        scales = layer.scales.data
+
+        unpacked_q_weight = torch.zeros(K, N, dtype=torch.int32, device=q_weight.device)
+        for i in range(8):
+            unpacked_q_weight[i::8, :] = (q_weight >> (i * 4)) & 0x0F
+
+        unpacked_q_zeros = torch.zeros(num_groups, N, dtype=torch.int32, device=q_zeros.device)
+        for i in range(8):
+            unpacked_q_zeros[:, i::8] = (q_zeros >> (i * 4)) & 0x0F
+
+        if not self.use_v2_format:
+            unpacked_q_zeros += 1  # GPTQ specific +1 for zeros
+
+        awq_q_weight = torch.zeros(K, N // 8, dtype=torch.int32, device=q_weight.device)
+        awq_q_zeros = torch.zeros(num_groups, N // 8, dtype=torch.int32, device=q_zeros.device)
+
+        shifts = [0, 16, 4, 20, 8, 24, 12, 28]
+        for i in range(8):
+            awq_q_weight |= (unpacked_q_weight[:, i::8] & 0xF) << shifts[i]
+            awq_q_zeros |= (unpacked_q_zeros[:, i::8] & 0xF) << shifts[i]
+
+        packed_weight, packed_zero, packed_scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            awq_q_weight, awq_q_zeros, scales.squeeze(1) if scales.dim() == 3 else scales
+        )
+        layer.qweight = torch.nn.Parameter(packed_weight, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(packed_zero, requires_grad=False)
+        layer.scales = torch.nn.Parameter(packed_scales, requires_grad=False)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+        if _is_cpu:
+            self._process_weights_for_cpu(layer)
+            return
 
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
@@ -582,6 +628,11 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x, layer.qweight, layer.qzeros, layer.scales, bias
+            )
+
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
