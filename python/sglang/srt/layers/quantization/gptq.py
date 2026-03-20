@@ -630,7 +630,7 @@ class GPTQLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if _is_cpu:
             return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                x, layer.qweight, layer.qzeros, layer.scales, bias
+                x, layer.qweight, layer.qzeros, layer.scales, bias.float() if bias is not None else None
             )
 
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)

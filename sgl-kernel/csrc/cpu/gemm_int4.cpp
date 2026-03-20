@@ -735,6 +735,12 @@ at::Tensor int4_scaled_mm_cpu_with_quant(const at::Tensor& input, const at::Tens
   int64_t lda = input.stride(0);
   const auto st = input.scalar_type();
   TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
+  
+  std::optional<at::Tensor> float_bias = std::nullopt;
+  if (bias.has_value()) {
+      float_bias = bias.value().to(at::kFloat);
+  }
+  
   constexpr bool sym_quant_act = false;
   using Tin = typename ActDtype<sym_quant_act>::type;
   int64_t act_buffer_size = M_a * K_a + M_a * sizeof(float) + M_a * sizeof(int32_t);
@@ -756,7 +762,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(const at::Tensor& input, const at::Tens
   const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
   const float* b_scales_ptr = weight_scales.data_ptr<float>();
   const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
-  const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
+  const float* bias_ptr = float_bias.has_value() ? float_bias.value().data_ptr<float>() : nullptr;
   int num_threads = at::get_num_threads();
   int64_t temp_buffer_size = (int64_t)num_threads * BLOCK_M * block_n_val * sizeof(float) + (int64_t)num_threads * _block_k * block_n_val;
   auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
