@@ -624,7 +624,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   int64_t G = scales.size(1);
   int64_t group_size = K / G;
   int64_t _block_k = get_4bit_block_k_size(group_size);
-  const int block_n = scales.size(-1); // Use dynamic N
+  int block_n = 16;
+  if (N % 256 == 0) block_n = 256;
+  else if (N % 128 == 0) block_n = 128;
+  else if (N % 64 == 0) block_n = 64;
+  else if (N % 32 == 0) block_n = 32;
+  else TORCH_CHECK(N % 16 == 0, "DA8W4: N must be divisible by 16");
   int64_t Nc = N / block_n;
   int64_t Kc = K / _block_k;
   auto weight_view = weight.view({Nc, block_n, Kc, _block_k});
@@ -696,8 +701,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(at
     int64_t G = _scales.size(2);
     int64_t group_size = K / G;
     int64_t _block_k = get_4bit_block_k_size(group_size);
-    int64_t block_n = _scales.size(-1);
-    int64_t Nc = _qweight.size(1) / block_n;
+    int64_t N = _qweight.size(1);
+    int64_t block_n = 16;
+    if (N % 256 == 0) block_n = 256;
+    else if (N % 128 == 0) block_n = 128;
+    else if (N % 64 == 0) block_n = 64;
+    else if (N % 32 == 0) block_n = 32;
+    else TORCH_CHECK(N % 16 == 0, "DA8W4: N must be divisible by 16");
+    int64_t Nc = N / block_n;
     int64_t Kc = K / _block_k;
     int64_t buffer_size_nbytes = _block_k * block_n / 2 + block_n * sizeof(int32_t);
     auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
