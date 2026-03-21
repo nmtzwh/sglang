@@ -728,6 +728,73 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(at
   return std::make_tuple(_qweight, _qzeros, _scales);
 }
 
+template <typename act_dtype, typename out_dtype, int64_t block_n>
+void _da16w4_linear_impl(
+    const act_dtype* __restrict__ input,
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ weight_scales,
+    const int8_t* __restrict__ weight_qzeros,
+    const float* __restrict__ bias,
+    out_dtype* __restrict__ output,
+    float* __restrict__ output_temp,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t num_groups) {
+
+  int64_t block_m = (M <= 48) ? M : (M < 64 ? 32 : (M < 96 ? 64 : 128));
+  int64_t Mc = div_up(M, block_m);
+  bool parallel_on_M = M > 128;
+  int64_t Nc = N / block_n;
+  int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
+  int64_t group_size = div_up(K, num_groups);
+  int64_t _block_k = get_4bit_block_k_size(group_size);
+  int64_t Kc = K / _block_k;
+  int64_t block_per_group = group_size / _block_k;
+
+  at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
+    int tid = get_thread_num();
+    float* C_tmp = output_temp + tid * block_m * block_n;
+    for (const auto i : c10::irange(begin, end)) {
+      int64_t mc = parallel_on_M ? i / Nc : 0;
+      int64_t nc = parallel_on_M ? i % Nc : i;
+      int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
+      for (int mci = mc; mci < mc_end; ++mci) {
+        int64_t m_size = std::min((int64_t)block_m, M - mci * block_m);
+        auto bias_data = bias ? bias + nc * block_n : nullptr;
+        copy_bias<block_n>(bias_data, C_tmp, m_size);
+        for (int kci = 0; kci < Kc; ++kci) {
+           const uint8_t* B_block = weight + (nc * Kc + kci) * (block_n * (_block_k / 2 + sizeof(int32_t)));
+           const float* scales_block = weight_scales + nc * block_n * num_groups + kci / block_per_group * block_n;
+           const int8_t* qzeros_block = weight_qzeros + nc * block_n * num_groups + kci / block_per_group * block_n;
+           const act_dtype* A_block = input + mci * block_m * lda + kci * _block_k;
+           for (int m = 0; m < m_size; ++m) {
+              for (int n = 0; n < block_n; ++n) {
+                 float sum = 0;
+                 int8_t zp = qzeros_block[n];
+                 for (int k = 0; k < _block_k; ++k) {
+                    float a_val = static_cast<float>(A_block[m * lda + k]);
+                    int k_out = k / 4;
+                    int k_in = k % 4;
+                    int n_out = (n / 16) * 8 + (n % 8);
+                    int n_in = (n / 8) % 2;
+                    uint8_t packed = B_block[k_out * (block_n * 2) + n_out * 4 + k_in];
+                    int8_t b_val;
+                    if (n_in == 0) b_val = (packed & 0xf) - zp;
+                    else b_val = (packed >> 4) - zp;
+                    sum += a_val * static_cast<float>(b_val);
+                 }
+                 C_tmp[m * block_n + n] += sum * scales_block[n];
+              }
+           }
+        }
+        store_out<out_dtype, block_n>(C_tmp, output + mci * block_m * N + nc * block_n, m_size, N);
+      }
+    }
+  });
+}
+
 at::Tensor int4_scaled_mm_cpu_with_quant(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& weight_scales, const at::Tensor& weight_qzeros, const std::optional<at::Tensor>& bias, at::ScalarType output_dtype) {
   RECORD_FUNCTION("sgl-kernel::int4_scaled_mm_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
   int64_t M_a = input.size(0);
@@ -741,14 +808,6 @@ at::Tensor int4_scaled_mm_cpu_with_quant(const at::Tensor& input, const at::Tens
       float_bias = bias.value().to(at::kFloat);
   }
   
-  constexpr bool sym_quant_act = false;
-  using Tin = typename ActDtype<sym_quant_act>::type;
-  int64_t act_buffer_size = M_a * K_a + M_a * sizeof(float) + M_a * sizeof(int32_t);
-  auto act_buffer = at::empty({act_buffer_size}, input.options().dtype(at::kByte));
-  auto Aq_data = act_buffer.data_ptr<uint8_t>();
-  auto As_data = reinterpret_cast<float*>(Aq_data + M_a * K_a);
-  auto Azp_data = reinterpret_cast<int32_t*>(As_data + M_a);
-  fill_val_stub(Azp_data, 128, M_a);
   auto out_sizes = input.sizes().vec();
   int64_t block_n_val = weight_scales.size(-1);
   int64_t N = weight_scales.size(0) * block_n_val;
@@ -763,27 +822,24 @@ at::Tensor int4_scaled_mm_cpu_with_quant(const at::Tensor& input, const at::Tens
   const float* b_scales_ptr = weight_scales.data_ptr<float>();
   const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
   const float* bias_ptr = float_bias.has_value() ? float_bias.value().data_ptr<float>() : nullptr;
+  
   int num_threads = at::get_num_threads();
-  int64_t temp_buffer_size = (int64_t)num_threads * BLOCK_M * block_n_val * sizeof(float) + (int64_t)num_threads * _block_k * block_n_val;
+  int64_t temp_buffer_size = (int64_t)num_threads * BLOCK_M * block_n_val * sizeof(float);
   auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
   float* c_temp_ptr = (float*)((void*)(c_temp_buffer.data_ptr<int8_t>()));
-  int8_t* dqB_temp_ptr = (int8_t*)((void*)(c_temp_ptr + (int64_t)num_threads * BLOCK_M * block_n_val));
 
-#define LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act) \
+#define LAUNCH_DA16W4_LINEAR_IMPL() \
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] { \
     const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>(); \
     scalar_t* __restrict__ c_ptr = output.data_ptr<scalar_t>(); \
-    at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) { \
-      for (int64_t m = begin; m < end; ++m) quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a); \
-    }); \
-    if (block_n_val == 128) _da8w4_linear_impl<Tin, scalar_t, sym_quant_act, 128, 64>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, dqB_temp_ptr, M_a, N, K_a, num_groups); \
-    else if (block_n_val == 256) _da8w4_linear_impl<Tin, scalar_t, sym_quant_act, 256, 128>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, dqB_temp_ptr, M_a, N, K_a, num_groups); \
-    else if (block_n_val == 16) _da8w4_linear_impl<Tin, scalar_t, sym_quant_act, 16, 8>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, dqB_temp_ptr, M_a, N, K_a, num_groups); \
-    else if (block_n_val == 32) _da8w4_linear_impl<Tin, scalar_t, sym_quant_act, 32, 16>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, dqB_temp_ptr, M_a, N, K_a, num_groups); \
-    else if (block_n_val == 64) _da8w4_linear_impl<Tin, scalar_t, sym_quant_act, 64, 32>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, dqB_temp_ptr, M_a, N, K_a, num_groups); \
-    else TORCH_CHECK(false, "DA8W4: unsupported block_n_val=", block_n_val); \
+    if (block_n_val == 128) _da16w4_linear_impl<scalar_t, scalar_t, 128>(A_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, M_a, N, K_a, lda, num_groups); \
+    else if (block_n_val == 256) _da16w4_linear_impl<scalar_t, scalar_t, 256>(A_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, M_a, N, K_a, lda, num_groups); \
+    else if (block_n_val == 16) _da16w4_linear_impl<scalar_t, scalar_t, 16>(A_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, M_a, N, K_a, lda, num_groups); \
+    else if (block_n_val == 32) _da16w4_linear_impl<scalar_t, scalar_t, 32>(A_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, M_a, N, K_a, lda, num_groups); \
+    else if (block_n_val == 64) _da16w4_linear_impl<scalar_t, scalar_t, 64>(A_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, c_temp_ptr, M_a, N, K_a, lda, num_groups); \
+    else TORCH_CHECK(false, "DA16W4: unsupported block_n_val=", block_n_val); \
   });
-  LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act);
+  LAUNCH_DA16W4_LINEAR_IMPL();
   return output;
 }
 
