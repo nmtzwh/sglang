@@ -319,7 +319,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
-                f"Unsupported quantization config: bits={weight_bits}, sym={is_sym}"
+                "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
             )
 
         # (num_bits, is_sym) -> quant_type
@@ -578,9 +578,7 @@ class GPTQLinearMethod(LinearMethodBase):
         for i in range(8):
             unpacked_q_weight[i::8, :] = (q_weight >> (i * 4)) & 0x0F
 
-        unpacked_q_zeros = torch.zeros(
-            num_groups, N, dtype=torch.int32, device=q_zeros.device
-        )
+        unpacked_q_zeros = torch.zeros(num_groups, N, dtype=torch.int32, device=q_zeros.device)
         for i in range(8):
             unpacked_q_zeros[:, i::8] = (q_zeros >> (i * 4)) & 0x0F
 
@@ -588,21 +586,15 @@ class GPTQLinearMethod(LinearMethodBase):
             unpacked_q_zeros += 1  # GPTQ specific +1 for zeros
 
         awq_q_weight = torch.zeros(K, N // 8, dtype=torch.int32, device=q_weight.device)
-        awq_q_zeros = torch.zeros(
-            num_groups, N // 8, dtype=torch.int32, device=q_zeros.device
-        )
+        awq_q_zeros = torch.zeros(num_groups, N // 8, dtype=torch.int32, device=q_zeros.device)
 
         shifts = [0, 16, 4, 20, 8, 24, 12, 28]
         for i in range(8):
             awq_q_weight |= (unpacked_q_weight[:, i::8] & 0xF) << shifts[i]
             awq_q_zeros |= (unpacked_q_zeros[:, i::8] & 0xF) << shifts[i]
 
-        packed_weight, packed_zero, packed_scales = (
-            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                awq_q_weight,
-                awq_q_zeros,
-                scales.squeeze(1) if scales.dim() == 3 else scales,
-            )
+        packed_weight, packed_zero, packed_scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            awq_q_weight, awq_q_zeros, scales.squeeze(1) if scales.dim() == 3 else scales
         )
         layer.qweight = torch.nn.Parameter(packed_weight, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(packed_zero, requires_grad=False)
@@ -636,23 +628,14 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        reshaped_x = x.reshape(-1, x.shape[-1])
-
         if _is_cpu:
-            # After _process_weights_for_cpu, convert_weight_packed_scale_zp
-            # packs scales into shape (Nc, num_groups, block_n) where N = Nc * block_n.
-            output_dim = layer.scales.shape[0] * layer.scales.shape[-1]
-            output = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                reshaped_x,
-                layer.qweight,
-                layer.qzeros,
-                layer.scales,
-                bias.float() if bias is not None else None,
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x, layer.qweight, layer.qzeros, layer.scales, bias.float() if bias is not None else None
             )
-            out_shape = x.shape[:-1] + (output_dim,)
-            return output.reshape(out_shape)
 
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
         output = gptq_gemm(
             reshaped_x,
             layer.qweight,
@@ -668,6 +651,7 @@ class GPTQLinearMethod(LinearMethodBase):
 
 
 class GPTQMoEAscendMethod(FusedMoEMethodBase):
+
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
         self.quant_config = quant_config
@@ -917,9 +901,9 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config is not None, (
-            "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
-        )
+        assert (
+            self.moe_runner_config is not None
+        ), "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
 
         assert self.moe_runner_config.activation in ("silu", "swiglu"), (
             f"Only SiLU/Swiglu activation is supported, "
@@ -1109,6 +1093,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             layer: torch.nn.Module, name: Optional[str], fn: Callable
         ) -> None:
             if name is not None and getattr(layer, name, None) is not None:
+
                 old_param = getattr(layer, name)
                 new_param = fn(old_param)
                 # replace the parameter with torch.nn.Parameter for TorchDynamo
@@ -1230,12 +1215,12 @@ def unpack_from_int32(
     :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
     :return: Unpacked tensor with int8 dtype after applying offset correction
     """
-    assert weight.dtype == torch.int32, (
-        f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
-    )
-    assert num_bits <= 8, (
-        f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
-    )
+    assert (
+        weight.dtype == torch.int32
+    ), f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+    assert (
+        num_bits <= 8
+    ), f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
 
     pack_factor = 32 // num_bits
     mask = (1 << num_bits) - 1
