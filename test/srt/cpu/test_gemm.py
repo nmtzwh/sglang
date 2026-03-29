@@ -36,7 +36,7 @@ class TestGemm(CustomTestCase):
     N_int8 = [32 * 12]
     K_int8 = [32 * 17]
 
-    M_fp8 = [1, 11]
+    M_fp8 = [1, 2, 4, 11]
     N_fp8 = [128, 224]
     K_fp8 = [512, 576]
 

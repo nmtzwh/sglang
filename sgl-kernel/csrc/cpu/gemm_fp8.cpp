@@ -266,6 +266,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       int64_t block_size_K) {
     constexpr int ROWS = BLOCK_M;
     const uint64_t vl_f32 = svcntw();
+    const uint64_t step_n = vl_f32 * 2;
 
     const int KB = div_up(K, BLOCK_K);
 
@@ -274,53 +275,220 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
     const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(B);
 
     constexpr int BLOCK_K2 = BLOCK_K >> 1;
+    constexpr int PREFETCH_K = 8;
+    // CVT_FP8_TO_BF16_EXT shifts exponent by +8, producing values 2^8 = 256x
+    // too large; compensate by multiplying scale with 2^-8.
+    constexpr float kFP8BiasCompensation = 1.0f / 256.0f;
 
-    for (int64_t n = 0; n < BLOCK_N; n += vl_f32) {
-      svbool_t pg = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
-      svfloat32_t acc0 = svdup_n_f32(0.f);
-      svfloat32_t acc1 = svdup_n_f32(0.f);
-      svfloat32_t acc2 = svdup_n_f32(0.f);
-      svfloat32_t acc3 = svdup_n_f32(0.f);
-      
-      if (has_bias) {
-        if (ROWS >= 1) acc0 = svld1_f32(pg, bias + n);
-        if (ROWS >= 2) acc1 = svld1_f32(pg, bias + n);
-        if (ROWS >= 3) acc2 = svld1_f32(pg, bias + n);
-        if (ROWS >= 4) acc3 = svld1_f32(pg, bias + n);
+    const float* a_row0 = a_ptr + 0 * lda2;
+    const float* a_row1 = a_ptr + 1 * lda2;
+    const float* a_row2 = a_ptr + 2 * lda2;
+    const float* a_row3 = a_ptr + 3 * lda2;
+    const svbool_t pg32_full = svptrue_b32();
+    const svbool_t pg8_full = svwhilelt_b8(0u, (uint32_t)(vl_f32 * 2));
+    const svbool_t pg16_full = svwhilelt_b16(0u, (uint32_t)vl_f32);
+
+    int64_t n = 0;
+    for (; n + step_n <= BLOCK_N; n += step_n) {
+      const int64_t n1 = n + vl_f32;
+      svfloat32_t acc0_0 = svdup_n_f32(0.f);
+      svfloat32_t acc0_1 = svdup_n_f32(0.f);
+      svfloat32_t acc1_0 = svdup_n_f32(0.f);
+      svfloat32_t acc1_1 = svdup_n_f32(0.f);
+      svfloat32_t acc2_0 = svdup_n_f32(0.f);
+      svfloat32_t acc2_1 = svdup_n_f32(0.f);
+      svfloat32_t acc3_0 = svdup_n_f32(0.f);
+      svfloat32_t acc3_1 = svdup_n_f32(0.f);
+
+      if constexpr (has_bias) {
+        if constexpr (ROWS >= 1) {
+          acc0_0 = svld1_f32(pg32_full, bias + n);
+          acc0_1 = svld1_f32(pg32_full, bias + n1);
+        }
+        if constexpr (ROWS >= 2) {
+          acc1_0 = svld1_f32(pg32_full, bias + n);
+          acc1_1 = svld1_f32(pg32_full, bias + n1);
+        }
+        if constexpr (ROWS >= 3) {
+          acc2_0 = svld1_f32(pg32_full, bias + n);
+          acc2_1 = svld1_f32(pg32_full, bias + n1);
+        }
+        if constexpr (ROWS >= 4) {
+          acc3_0 = svld1_f32(pg32_full, bias + n);
+          acc3_1 = svld1_f32(pg32_full, bias + n1);
+        }
       }
 
       for (int kb = 0; kb < KB; ++kb) {
         int kb_start = kb * BLOCK_K2;
         int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
-        float block_scale = scale[kb];
+        svfloat32_t vs = svdup_f32(scale[kb] * kFP8BiasCompensation);
 
-        svfloat32_t bacc0 = svdup_n_f32(0.f);
-        svfloat32_t bacc1 = svdup_n_f32(0.f);
-        svfloat32_t bacc2 = svdup_n_f32(0.f);
-        svfloat32_t bacc3 = svdup_n_f32(0.f);
+        svfloat32_t bacc0_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc0_1 = svdup_n_f32(0.f);
+        svfloat32_t bacc1_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc1_1 = svdup_n_f32(0.f);
+        svfloat32_t bacc2_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc2_1 = svdup_n_f32(0.f);
+        svfloat32_t bacc3_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc3_1 = svdup_n_f32(0.f);
 
         for (int k = kb_start; k < kb_end; ++k) {
-          svbool_t pg8 = svwhilelt_b8(0u, (uint32_t)((BLOCK_N - n) * 2));
-          svuint8_t v_fp8 = svld1_u8(pg8, b_ptr + k * ldb * 2 + n * 2);
-          svbfloat16_t vb = SVE_CVT_FP8_TO_BF16(v_fp8);
-          if (ROWS >= 1) bacc0 = svbfdot_f32(bacc0, svreinterpret_bf16(svdup_f32(a_ptr[0 * lda2 + k])), vb);
-          if (ROWS >= 2) bacc1 = svbfdot_f32(bacc1, svreinterpret_bf16(svdup_f32(a_ptr[1 * lda2 + k])), vb);
-          if (ROWS >= 3) bacc2 = svbfdot_f32(bacc2, svreinterpret_bf16(svdup_f32(a_ptr[2 * lda2 + k])), vb);
-          if (ROWS >= 4) bacc3 = svbfdot_f32(bacc3, svreinterpret_bf16(svdup_f32(a_ptr[3 * lda2 + k])), vb);
+          if (k + PREFETCH_K < kb_end) {
+            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
+            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n1 * 2, 0, 3);
+          }
+
+          svuint8_t v_fp8_0 = svld1_u8(pg8_full, b_ptr + k * ldb * 2 + n * 2);
+          svuint8_t v_fp8_1 = svld1_u8(pg8_full, b_ptr + k * ldb * 2 + n1 * 2);
+          svbfloat16_t vb0 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_0);
+          svbfloat16_t vb1 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_1);
+
+          if constexpr (ROWS >= 1) {
+            svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
+            bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
+            bacc0_1 = svbfdot_f32(bacc0_1, va0, vb1);
+          }
+          if constexpr (ROWS >= 2) {
+            svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
+            bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
+            bacc1_1 = svbfdot_f32(bacc1_1, va1, vb1);
+          }
+          if constexpr (ROWS >= 3) {
+            svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
+            bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
+            bacc2_1 = svbfdot_f32(bacc2_1, va2, vb1);
+          }
+          if constexpr (ROWS >= 4) {
+            svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
+            bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
+            bacc3_1 = svbfdot_f32(bacc3_1, va3, vb1);
+          }
         }
 
-        svfloat32_t vs = svdup_f32(block_scale);
-        if (ROWS >= 1) acc0 = svmla_f32_x(pg, acc0, bacc0, vs);
-        if (ROWS >= 2) acc1 = svmla_f32_x(pg, acc1, bacc1, vs);
-        if (ROWS >= 3) acc2 = svmla_f32_x(pg, acc2, bacc2, vs);
-        if (ROWS >= 4) acc3 = svmla_f32_x(pg, acc3, bacc3, vs);
+        if constexpr (ROWS >= 1) {
+          acc0_0 = svmla_f32_x(pg32_full, acc0_0, bacc0_0, vs);
+          acc0_1 = svmla_f32_x(pg32_full, acc0_1, bacc0_1, vs);
+        }
+        if constexpr (ROWS >= 2) {
+          acc1_0 = svmla_f32_x(pg32_full, acc1_0, bacc1_0, vs);
+          acc1_1 = svmla_f32_x(pg32_full, acc1_1, bacc1_1, vs);
+        }
+        if constexpr (ROWS >= 3) {
+          acc2_0 = svmla_f32_x(pg32_full, acc2_0, bacc2_0, vs);
+          acc2_1 = svmla_f32_x(pg32_full, acc2_1, bacc2_1, vs);
+        }
+        if constexpr (ROWS >= 4) {
+          acc3_0 = svmla_f32_x(pg32_full, acc3_0, bacc3_0, vs);
+          acc3_1 = svmla_f32_x(pg32_full, acc3_1, bacc3_1, vs);
+        }
       }
 
-      // Store results: fp32 -> bf16
-      if (ROWS >= 1) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n), sve_f32_to_bf16(pg, acc0));
-      if (ROWS >= 2) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n), sve_f32_to_bf16(pg, acc1));
-      if (ROWS >= 3) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n), sve_f32_to_bf16(pg, acc2));
-      if (ROWS >= 4) svst1_bf16(svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N), reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n), sve_f32_to_bf16(pg, acc3));
+      if constexpr (ROWS >= 1) {
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n), sve_f32_to_bf16(pg32_full, acc0_0));
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n1), sve_f32_to_bf16(pg32_full, acc0_1));
+      }
+      if constexpr (ROWS >= 2) {
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n), sve_f32_to_bf16(pg32_full, acc1_0));
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n1), sve_f32_to_bf16(pg32_full, acc1_1));
+      }
+      if constexpr (ROWS >= 3) {
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n), sve_f32_to_bf16(pg32_full, acc2_0));
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n1), sve_f32_to_bf16(pg32_full, acc2_1));
+      }
+      if constexpr (ROWS >= 4) {
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n), sve_f32_to_bf16(pg32_full, acc3_0));
+        svst1_bf16(pg16_full, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n1), sve_f32_to_bf16(pg32_full, acc3_1));
+      }
+    }
+
+    if (n < BLOCK_N) {
+      svbool_t pg0 = svwhilelt_b32((uint32_t)n, (uint32_t)BLOCK_N);
+      svbool_t pg8_0 = svwhilelt_b8((uint32_t)(n * 2), (uint32_t)(BLOCK_N * 2));
+      svbool_t pg16_0 = svwhilelt_b16((uint32_t)n, (uint32_t)BLOCK_N);
+
+      svfloat32_t acc0_0 = svdup_n_f32(0.f);
+      svfloat32_t acc1_0 = svdup_n_f32(0.f);
+      svfloat32_t acc2_0 = svdup_n_f32(0.f);
+      svfloat32_t acc3_0 = svdup_n_f32(0.f);
+
+      if constexpr (has_bias) {
+        if constexpr (ROWS >= 1) {
+          acc0_0 = svld1_f32(pg0, bias + n);
+        }
+        if constexpr (ROWS >= 2) {
+          acc1_0 = svld1_f32(pg0, bias + n);
+        }
+        if constexpr (ROWS >= 3) {
+          acc2_0 = svld1_f32(pg0, bias + n);
+        }
+        if constexpr (ROWS >= 4) {
+          acc3_0 = svld1_f32(pg0, bias + n);
+        }
+      }
+
+      for (int kb = 0; kb < KB; ++kb) {
+        int kb_start = kb * BLOCK_K2;
+        int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
+        svfloat32_t vs = svdup_f32(scale[kb] * kFP8BiasCompensation);
+
+        svfloat32_t bacc0_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc1_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc2_0 = svdup_n_f32(0.f);
+        svfloat32_t bacc3_0 = svdup_n_f32(0.f);
+
+        for (int k = kb_start; k < kb_end; ++k) {
+          if (k + PREFETCH_K < kb_end) {
+            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
+          }
+
+          svuint8_t v_fp8_0 = svld1_u8(pg8_0, b_ptr + k * ldb * 2 + n * 2);
+          svbfloat16_t vb0 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_0);
+
+          if constexpr (ROWS >= 1) {
+            svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
+            bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
+          }
+          if constexpr (ROWS >= 2) {
+            svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
+            bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
+          }
+          if constexpr (ROWS >= 3) {
+            svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
+            bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
+          }
+          if constexpr (ROWS >= 4) {
+            svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
+            bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
+          }
+        }
+
+        if constexpr (ROWS >= 1) {
+          acc0_0 = svmla_f32_x(pg0, acc0_0, bacc0_0, vs);
+        }
+        if constexpr (ROWS >= 2) {
+          acc1_0 = svmla_f32_x(pg0, acc1_0, bacc1_0, vs);
+        }
+        if constexpr (ROWS >= 3) {
+          acc2_0 = svmla_f32_x(pg0, acc2_0, bacc2_0, vs);
+        }
+        if constexpr (ROWS >= 4) {
+          acc3_0 = svmla_f32_x(pg0, acc3_0, bacc3_0, vs);
+        }
+      }
+
+      if constexpr (ROWS >= 1) {
+        svst1_bf16(pg16_0, reinterpret_cast<bfloat16_t*>(C + 0 * ldc + n), sve_f32_to_bf16(pg0, acc0_0));
+      }
+      if constexpr (ROWS >= 2) {
+        svst1_bf16(pg16_0, reinterpret_cast<bfloat16_t*>(C + 1 * ldc + n), sve_f32_to_bf16(pg0, acc1_0));
+      }
+      if constexpr (ROWS >= 3) {
+        svst1_bf16(pg16_0, reinterpret_cast<bfloat16_t*>(C + 2 * ldc + n), sve_f32_to_bf16(pg0, acc2_0));
+      }
+      if constexpr (ROWS >= 4) {
+        svst1_bf16(pg16_0, reinterpret_cast<bfloat16_t*>(C + 3 * ldc + n), sve_f32_to_bf16(pg0, acc3_0));
+      }
     }
   }
 };
@@ -428,6 +596,29 @@ void tinygemm_kernel(
     return;
   }
 
+#if defined(CPU_CAPABILITY_SVE)
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    constexpr int64_t mb_start = 0;
+    constexpr int64_t nb_start = 0;
+    switch (M << 4 | N >> 4) {
+      case 0x12:
+        LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+        return;
+      case 0x22:
+        LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
+        return;
+      case 0x32:
+        LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
+        return;
+      case 0x42:
+        LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
+        return;
+      default:
+        break;
+    }
+  }
+#endif
+
   // pattern: 1-4-16
   constexpr int64_t BLOCK_M = 4;
   constexpr int64_t BLOCK_N = 64;
@@ -490,8 +681,12 @@ void fp8_scaled_mm_kernel_impl(
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
       int tid = get_thread_num();
-      scalar_t* __restrict__ Btmp = buffer + tid * buffer_size_per_thread;
-      float* __restrict__ Ctmp = (float*)((void*)(Btmp + MAX_CACHE_BLOCK_SIZE * BLOCK_N * K));
+      scalar_t* __restrict__ Btmp = nullptr;
+      float* __restrict__ Ctmp = nullptr;
+      if (use_brgemm) {
+        Btmp = buffer + tid * buffer_size_per_thread;
+        Ctmp = (float*)((void*)(Btmp + MAX_CACHE_BLOCK_SIZE * BLOCK_N * K));
+      }
 
       loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         const float* scale_ptr = scales2 + (nb / blocks_n_per_group) * scale_size_K;
@@ -508,10 +703,10 @@ void fp8_scaled_mm_kernel_impl(
             /*   A            */ mat1 + mb_start * mat1_strideM,
             /*   B            */ mat2 + nb_start * K,  // nb * BLOCK_N * K
             /*   C            */ out + mb_start * out_strideM + nb_start,
-            /*   Btmp         */ Btmp + nb_offset * BLOCK_N * K,
+            /*   Btmp         */ Btmp == nullptr ? nullptr : Btmp + nb_offset * BLOCK_N * K,
             /*   Ctmp         */ Ctmp,
             /*   scale        */ scale_ptr,
-            /*   bias         */ bias + nb_start,
+            /*   bias         */ bias == nullptr ? nullptr : bias + nb_start,
             /*   M            */ mb_size,
             /*   N            */ nb_size,
             /*   K            */ K,
@@ -609,6 +804,8 @@ at::Tensor fp8_scaled_mm_cpu(
   constexpr int64_t BLOCK_N = block_size_n();
   TORCH_CHECK(block_size_N % BLOCK_N == 0, "fp8_scaled_mm_cpu: expect block_size_N to be multiples of BLOCK_N");
   TORCH_CHECK(block_size_K == BLOCK_K, "fp8_scaled_mm_cpu: expect block_size_K equals to BLOCK_K");
+  TORCH_CHECK(N % BLOCK_N == 0,
+      "fp8_scaled_mm_cpu: expect N (", N, ") to be a multiple of BLOCK_N (", BLOCK_N, ")");
   CHECK_EQ(scales2.size(0), div_up(N, block_size_N));
   CHECK_EQ(scales2.size(1), div_up(K, block_size_K));
 
@@ -633,8 +830,9 @@ at::Tensor fp8_scaled_mm_cpu(
   // Btmp : [T, BLOCK_N * K]
   // Ctmp : [T, BLOCK_M * BLOCK_N]
   int num_threads = at::get_num_threads();
-  int64_t size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2;
-  auto buffer = at::empty({num_threads, size_per_thread}, mat1.options());
+  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
+  int64_t size_per_thread = use_brgemm ? (MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2) : 0;
+  auto buffer = size_per_thread > 0 ? at::empty({num_threads, size_per_thread}, mat1.options()) : at::empty({0}, mat1.options());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_scaled_mm_kernel_impl", [&] {
     fp8_scaled_mm_kernel_impl<scalar_t>(
