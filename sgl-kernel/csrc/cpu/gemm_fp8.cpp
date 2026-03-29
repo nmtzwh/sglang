@@ -333,37 +333,47 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
         svfloat32_t bacc3_0 = svdup_n_f32(0.f);
         svfloat32_t bacc3_1 = svdup_n_f32(0.f);
 
-        for (int k = kb_start; k < kb_end; ++k) {
-          if (k + PREFETCH_K < kb_end) {
-            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
-            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n1 * 2, 0, 3);
+        if (kb_start < kb_end) {
+          auto accumulate_pair = [&](int k, svbfloat16_t vb0, svbfloat16_t vb1) {
+            if constexpr (ROWS >= 1) {
+              svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
+              bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
+              bacc0_1 = svbfdot_f32(bacc0_1, va0, vb1);
+            }
+            if constexpr (ROWS >= 2) {
+              svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
+              bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
+              bacc1_1 = svbfdot_f32(bacc1_1, va1, vb1);
+            }
+            if constexpr (ROWS >= 3) {
+              svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
+              bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
+              bacc2_1 = svbfdot_f32(bacc2_1, va2, vb1);
+            }
+            if constexpr (ROWS >= 4) {
+              svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
+              bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
+              bacc3_1 = svbfdot_f32(bacc3_1, va3, vb1);
+            }
+          };
+
+          svuint8_t cur_fp8_0 = svld1_u8(pg8_full, b_ptr + kb_start * ldb * 2 + n * 2);
+          svuint8_t cur_fp8_1 = svld1_u8(pg8_full, b_ptr + kb_start * ldb * 2 + n1 * 2);
+
+          for (int k = kb_start; k < kb_end - 1; ++k) {
+            if (k + PREFETCH_K < kb_end) {
+              __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
+              __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n1 * 2, 0, 3);
+            }
+
+            svuint8_t next_fp8_0 = svld1_u8(pg8_full, b_ptr + (k + 1) * ldb * 2 + n * 2);
+            svuint8_t next_fp8_1 = svld1_u8(pg8_full, b_ptr + (k + 1) * ldb * 2 + n1 * 2);
+            accumulate_pair(k, SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_0), SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_1));
+            cur_fp8_0 = next_fp8_0;
+            cur_fp8_1 = next_fp8_1;
           }
 
-          svuint8_t v_fp8_0 = svld1_u8(pg8_full, b_ptr + k * ldb * 2 + n * 2);
-          svuint8_t v_fp8_1 = svld1_u8(pg8_full, b_ptr + k * ldb * 2 + n1 * 2);
-          svbfloat16_t vb0 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_0);
-          svbfloat16_t vb1 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_1);
-
-          if constexpr (ROWS >= 1) {
-            svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
-            bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
-            bacc0_1 = svbfdot_f32(bacc0_1, va0, vb1);
-          }
-          if constexpr (ROWS >= 2) {
-            svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
-            bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
-            bacc1_1 = svbfdot_f32(bacc1_1, va1, vb1);
-          }
-          if constexpr (ROWS >= 3) {
-            svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
-            bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
-            bacc2_1 = svbfdot_f32(bacc2_1, va2, vb1);
-          }
-          if constexpr (ROWS >= 4) {
-            svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
-            bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
-            bacc3_1 = svbfdot_f32(bacc3_1, va3, vb1);
-          }
+          accumulate_pair(kb_end - 1, SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_0), SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_1));
         }
 
         if constexpr (ROWS >= 1) {
@@ -437,30 +447,39 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
         svfloat32_t bacc2_0 = svdup_n_f32(0.f);
         svfloat32_t bacc3_0 = svdup_n_f32(0.f);
 
-        for (int k = kb_start; k < kb_end; ++k) {
-          if (k + PREFETCH_K < kb_end) {
-            __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
+        if (kb_start < kb_end) {
+          auto accumulate_tail = [&](int k, svbfloat16_t vb0) {
+            if constexpr (ROWS >= 1) {
+              svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
+              bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
+            }
+            if constexpr (ROWS >= 2) {
+              svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
+              bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
+            }
+            if constexpr (ROWS >= 3) {
+              svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
+              bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
+            }
+            if constexpr (ROWS >= 4) {
+              svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
+              bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
+            }
+          };
+
+          svuint8_t cur_fp8_0 = svld1_u8(pg8_0, b_ptr + kb_start * ldb * 2 + n * 2);
+
+          for (int k = kb_start; k < kb_end - 1; ++k) {
+            if (k + PREFETCH_K < kb_end) {
+              __builtin_prefetch(b_ptr + (k + PREFETCH_K) * ldb * 2 + n * 2, 0, 3);
+            }
+
+            svuint8_t next_fp8_0 = svld1_u8(pg8_0, b_ptr + (k + 1) * ldb * 2 + n * 2);
+            accumulate_tail(k, SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_0));
+            cur_fp8_0 = next_fp8_0;
           }
 
-          svuint8_t v_fp8_0 = svld1_u8(pg8_0, b_ptr + k * ldb * 2 + n * 2);
-          svbfloat16_t vb0 = SVE_CVT_FP8_TO_BF16_EXT(v_fp8_0);
-
-          if constexpr (ROWS >= 1) {
-            svbfloat16_t va0 = svreinterpret_bf16(svdup_f32(a_row0[k]));
-            bacc0_0 = svbfdot_f32(bacc0_0, va0, vb0);
-          }
-          if constexpr (ROWS >= 2) {
-            svbfloat16_t va1 = svreinterpret_bf16(svdup_f32(a_row1[k]));
-            bacc1_0 = svbfdot_f32(bacc1_0, va1, vb0);
-          }
-          if constexpr (ROWS >= 3) {
-            svbfloat16_t va2 = svreinterpret_bf16(svdup_f32(a_row2[k]));
-            bacc2_0 = svbfdot_f32(bacc2_0, va2, vb0);
-          }
-          if constexpr (ROWS >= 4) {
-            svbfloat16_t va3 = svreinterpret_bf16(svdup_f32(a_row3[k]));
-            bacc3_0 = svbfdot_f32(bacc3_0, va3, vb0);
-          }
+          accumulate_tail(kb_end - 1, SVE_CVT_FP8_TO_BF16_EXT(cur_fp8_0));
         }
 
         if constexpr (ROWS >= 1) {
