@@ -1,5 +1,4 @@
 import logging
-import weakref
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -294,7 +293,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.clear()
         self._kvcache = kvcache
-        self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
         return min(
