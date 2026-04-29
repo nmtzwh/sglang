@@ -2670,6 +2670,31 @@ class ServerArgs:
             self.speculative_draft_model_path,
         )
 
+        if self.speculative_skip_dp_mlp_sync:
+            assert self.speculative_algorithm == "EAGLE", (
+                "--speculative-skip-dp-mlp-sync is only supported with "
+                f"speculative_algorithm == EAGLE, got {self.speculative_algorithm}."
+            )
+
+        if self.speculative_algorithm == "FROZEN_KV_MTP":
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "Frozen-KV MTP speculative decoding."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.device == "cpu":
                 if self.speculative_algorithm != "EAGLE":
