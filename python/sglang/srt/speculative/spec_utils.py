@@ -49,6 +49,25 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
 
 
+class _DeviceDispatchKernel:
+    def __init__(self, triton_kernel, cpu_func):
+        self.triton_kernel = triton_kernel
+        self.cpu_func = cpu_func
+
+    def __getitem__(self, grid):
+        triton_launcher = self.triton_kernel[grid]
+
+        def launcher(*args, **kwargs):
+            first_tensor = next(
+                (arg for arg in args if isinstance(arg, torch.Tensor)), None
+            )
+            if first_tensor is not None and first_tensor.device.type == "cpu":
+                return self.cpu_func(*args, **kwargs)
+            return triton_launcher(*args, **kwargs)
+
+        return launcher
+
+
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
@@ -58,7 +77,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
 
 
 @triton.jit
-def create_extend_after_decode_spec_info(
+def _create_extend_after_decode_spec_info_kernel(
     verified_id,
     seq_lens,
     accept_lens,
@@ -81,6 +100,35 @@ def create_extend_after_decode_spec_info(
     accept_len_cumsum += accept_length - 1
     verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
+
+
+def _create_extend_after_decode_spec_info_cpu(
+    verified_id,
+    seq_lens,
+    accept_lens,
+    positions,
+    new_verified_id,
+    bs_upper,
+):
+    del bs_upper
+    offset = 0
+    for i in range(seq_lens.numel()):
+        accept_len = int(accept_lens[i].item())
+        seq_len = int(seq_lens[i].item())
+        positions[offset : offset + accept_len] = torch.arange(
+            seq_len - accept_len,
+            seq_len,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        new_verified_id[i] = verified_id[offset + accept_len - 1]
+        offset += accept_len
+
+
+create_extend_after_decode_spec_info = _DeviceDispatchKernel(
+    _create_extend_after_decode_spec_info_kernel,
+    _create_extend_after_decode_spec_info_cpu,
+)
 
 
 @triton.jit
@@ -126,6 +174,19 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    if req_pool_indices.device.type == "cpu":
+        out_offset = 0
+        for i in range(batch_size):
+            start = int(start_offset[i].item())
+            end = int(end_offset[i].item())
+            req_idx = int(req_pool_indices[i].item())
+            length = end - start
+            req_to_token[req_idx, start:end] = out_cache_loc[
+                out_offset : out_offset + length
+            ].to(req_to_token.dtype)
+            out_offset += length
+        return
+
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -138,7 +199,7 @@ def assign_req_to_token_pool_func(
 
 
 @triton.jit
-def assign_draft_cache_locs(
+def _assign_draft_cache_locs_kernel(
     req_pool_indices,
     req_to_token,
     seq_lens,
@@ -246,6 +307,86 @@ def assign_draft_cache_locs(
             )
 
 
+def _assign_draft_cache_locs_cpu(
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    extend_lens,
+    num_new_pages_per_topk,
+    out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    duplicate_cache_len,
+    pool_len,
+    topk,
+    speculative_num_steps,
+    page_size,
+    bs_upper,
+    iter_upper,
+):
+    del duplicate_cache_len, pool_len, bs_upper, iter_upper
+    num_seqs = req_pool_indices.numel()
+    out_offset = 0
+    original_out_cache_loc = out_cache_loc.clone()
+
+    for pid in range(num_seqs):
+        req_idx = int(req_pool_indices[pid].item())
+        kv_start = int(seq_lens[pid].item())
+        if page_size == 1 or topk == 1:
+            copy_len = topk * speculative_num_steps
+            out_start = pid * topk * speculative_num_steps
+        else:
+            copy_len = int(extend_lens[pid].item())
+            out_start = out_offset
+            out_offset += copy_len
+
+        req_to_token[req_idx, kv_start : kv_start + copy_len] = original_out_cache_loc[
+            out_start : out_start + copy_len
+        ].to(req_to_token.dtype)
+
+        if page_size == 1 or topk == 1:
+            continue
+
+        last_page_len = kv_start % page_size
+        if last_page_len == 0:
+            continue
+
+        num_new_pages = int(num_new_pages_per_topk[pid].item())
+        prefix_base = kv_start - last_page_len
+        src_indices = req_to_token[
+            req_idx, prefix_base : prefix_base + last_page_len
+        ].to(source_cache_loc.dtype)
+        last_page_lens_cumsum_cur = int(last_page_lens_cumsum[pid].item())
+        dup_base = (topk - 1) * (last_page_lens_cumsum_cur - last_page_len)
+
+        for topk_id in range(1, topk):
+            dup_start = dup_base + (topk_id - 1) * last_page_len
+            source_cache_loc[dup_start : dup_start + last_page_len] = src_indices
+            tgt_start = prefix_base + topk_id * num_new_pages * page_size
+            target_cache_loc[dup_start : dup_start + last_page_len] = req_to_token[
+                req_idx, tgt_start : tgt_start + last_page_len
+            ].to(target_cache_loc.dtype)
+
+        ptr_offset = pid * speculative_num_steps * topk
+        for topk_id in range(topk):
+            src_start = (
+                prefix_base
+                + topk_id * num_new_pages * page_size
+                + last_page_len
+            )
+            dst_start = ptr_offset + topk_id * speculative_num_steps
+            out_cache_loc[dst_start : dst_start + speculative_num_steps] = req_to_token[
+                req_idx, src_start : src_start + speculative_num_steps
+            ].to(out_cache_loc.dtype)
+
+
+assign_draft_cache_locs = _DeviceDispatchKernel(
+    _assign_draft_cache_locs_kernel,
+    _assign_draft_cache_locs_cpu,
+)
+
+
 @triton.jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,
@@ -328,7 +469,7 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
-def align_evict_mask_to_page_size(
+def _align_evict_mask_to_page_size_kernel(
     seq_lens,
     evict_mask,
     page_size: tl.constexpr,
@@ -350,6 +491,30 @@ def align_evict_mask_to_page_size(
     start = (seq_len + num_false - 1) // page_size * page_size - seq_len
     for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
+
+
+def _align_evict_mask_to_page_size_cpu(
+    seq_lens,
+    evict_mask,
+    page_size,
+    num_draft_tokens,
+    BLOCK_SIZE,
+):
+    del BLOCK_SIZE
+    evict_mask_2d = evict_mask.view(seq_lens.numel(), num_draft_tokens)
+    for bid in range(seq_lens.numel()):
+        seq_len = int(seq_lens[bid].item())
+        num_trues = int(evict_mask_2d[bid].sum().item())
+        num_false = num_draft_tokens - num_trues
+        start = ((seq_len + num_false - 1) // page_size) * page_size - seq_len
+        for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
+            evict_mask_2d[bid, i] = False
+
+
+align_evict_mask_to_page_size = _DeviceDispatchKernel(
+    _align_evict_mask_to_page_size_kernel,
+    _align_evict_mask_to_page_size_cpu,
+)
 
 
 @triton.jit

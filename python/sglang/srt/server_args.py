@@ -957,6 +957,8 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
+            if self.speculative_algorithm is not None:
+                self.disable_cuda_graph = True
 
     def _handle_npu_backends(self):
         if self.device == "npu":
@@ -2619,6 +2621,24 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+            if self.device == "cpu":
+                if self.speculative_algorithm != "EAGLE":
+                    raise ValueError(
+                        "CPU speculative decoding currently supports only EAGLE."
+                    )
+                if envs.SGLANG_ENABLE_SPEC_V2.get():
+                    raise ValueError(
+                        "CPU EAGLE speculative decoding does not support spec v2."
+                    )
+                if self.attention_backend != "intel_amx":
+                    raise ValueError(
+                        "CPU EAGLE speculative decoding requires --attention-backend intel_amx."
+                    )
+                if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                    raise ValueError(
+                        "CPU EAGLE speculative decoding does not support overlap modes."
+                    )
+
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
@@ -2695,6 +2715,11 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+
+            if self.device == "cpu" and self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "CPU EAGLE speculative decoding requires --speculative-eagle-topk 1."
+                )
 
             if (
                 self.attention_backend == "trtllm_mha"

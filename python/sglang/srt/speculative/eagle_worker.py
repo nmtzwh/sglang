@@ -236,6 +236,8 @@ class EAGLEWorker(TpModelWorker):
 
         if self.server_args.disable_cuda_graph:
             return
+        if self.target_worker.device == "cpu":
+            return
 
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
@@ -575,6 +577,7 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                device=self.device,
             )
 
         (

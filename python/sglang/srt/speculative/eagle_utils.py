@@ -118,7 +118,29 @@ def build_tree_kernel_efficient(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
 
-    if _is_npu:
+    if device.type == "cpu":
+        if topk != 1 or num_verify_tokens != spec_steps + 1:
+            raise NotImplementedError(
+                "CPU EAGLE tree construction only supports topk=1 chain mode."
+            )
+        retrive_index.copy_(
+            torch.arange(bs * num_verify_tokens, device=device, dtype=torch.long).view(
+                bs, num_verify_tokens
+            )
+        )
+        retrive_next_token.fill_(-1)
+        if num_verify_tokens > 1:
+            retrive_next_token[:, :-1] = torch.arange(
+                1, num_verify_tokens, device=device, dtype=torch.long
+            )
+        retrive_next_sibling.fill_(-1)
+        positions.copy_(
+            (
+                seq_lens.to(dtype=torch.long).unsqueeze(1)
+                + torch.arange(num_verify_tokens, device=device, dtype=torch.long)
+            ).flatten()
+        )
+    elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),
             top_scores_index,
@@ -169,7 +191,39 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip:
+    if predicts.device.type == "cpu":
+        if topk != 1:
+            raise NotImplementedError(
+                "CPU greedy tree verification only supports topk=1."
+            )
+        predicts.fill_(-1)
+        accept_index.fill_(-1)
+        accept_token_num.zero_()
+
+        for bid in range(candidates.shape[0]):
+            current = 0
+            accepted = []
+            while current != -1 and len(accepted) < accept_index.shape[1]:
+                global_index = int(retrive_index[bid, current].item())
+                predicted = target_predict[bid, current].to(dtype=predicts.dtype)
+                predicts[global_index] = predicted
+                accepted.append(global_index)
+
+                child = int(retrive_next_token[bid, current].item())
+                next_current = -1
+                while child != -1:
+                    if candidates[bid, child].item() == int(predicted.item()):
+                        next_current = child
+                        break
+                    child = int(retrive_next_sibling[bid, child].item())
+                current = next_current
+
+            accept_index[bid, : len(accepted)] = torch.tensor(
+                accepted, dtype=accept_index.dtype, device=accept_index.device
+            )
+            accept_token_num[bid] = max(0, len(accepted) - 1)
+
+    elif _is_cuda or _is_hip:
         from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(

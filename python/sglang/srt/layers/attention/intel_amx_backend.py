@@ -163,3 +163,20 @@ class IntelAMXAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
+
+
+class IntelAMXMultiStepDraftBackend:
+    def __init__(
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+    ):
+        if topk != 1:
+            raise ValueError(
+                "Intel AMX EAGLE draft decode only supports speculative_eagle_topk=1."
+            )
+        self.attn_backends = [
+            IntelAMXAttnBackend(model_runner) for _ in range(speculative_num_steps - 1)
+        ]
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
