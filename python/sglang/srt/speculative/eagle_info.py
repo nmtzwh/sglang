@@ -333,9 +333,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
-            if str(batch.device) == "cpu":
-                accept_index[:, 1:] = -1
-                accept_length.zero_()
 
         else:
             # apply temperature and get target probs

@@ -798,9 +798,6 @@ class EAGLEWorker(TpModelWorker):
         spec_info: EagleVerifyInput,
         seq_lens_pre_verify: torch.Tensor,
     ):
-        if str(batch.device) == "cpu" and spec_info.topk == 1:
-            return
-
         accepted_length = (
             torch.tensor(
                 res.accept_length_per_req_cpu,

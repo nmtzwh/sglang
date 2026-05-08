@@ -28,6 +28,73 @@ elif is_cpu():
     )
 
 
+def cpu_target_verify_gdn_chain(
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    intermediate_states_buffer: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = query_start_loc.shape[0] - 1
+    seq_len = q.shape[1]
+    if seq_len % batch_size != 0:
+        raise RuntimeError(f"Invalid CPU GDN MTP verify shape: {seq_len=} {batch_size=}")
+    draft_token_num = seq_len // batch_size
+
+    num_q_heads = q.shape[2]
+    head_q_dim = q.shape[3]
+    num_v_heads = v.shape[2]
+    head_v_dim = v.shape[3]
+
+    q_mtp = q.view(batch_size, draft_token_num, num_q_heads, head_q_dim)
+    k_mtp = k.view(batch_size, draft_token_num, num_q_heads, head_q_dim)
+    v_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
+    a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
+    b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
+
+    scratch_indices = torch.arange(
+        batch_size, dtype=torch.int32, device=cache_indices.device
+    )
+    scratch_ssm_states = ssm_states[cache_indices[:batch_size].to(torch.int64)].clone()
+    scratch_query_start_loc = torch.arange(
+        0, batch_size + 1, dtype=torch.int32, device=q.device
+    )
+
+    outputs = []
+    for step in range(draft_token_num):
+        step_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q_mtp[:, step : step + 1].transpose(0, 1).contiguous(),
+            k=k_mtp[:, step : step + 1].transpose(0, 1).contiguous(),
+            v=v_mtp[:, step : step + 1].transpose(0, 1).contiguous(),
+            a=a_mtp[:, step].contiguous(),
+            b=b_mtp[:, step].contiguous(),
+            initial_state_source=scratch_ssm_states,
+            initial_state_indices=scratch_indices,
+            cu_seqlens=scratch_query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+        intermediate_states_buffer[:, step].index_copy_(
+            0,
+            intermediate_state_indices[:batch_size].to(torch.int64),
+            scratch_ssm_states,
+        )
+        outputs.append(step_out.squeeze(0))
+
+    return torch.stack(outputs, dim=1).reshape(1, seq_len, num_v_heads, head_v_dim)
+
+
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
@@ -116,55 +183,19 @@ class TritonGDNKernel(LinearAttnKernelBase):
             if retrieve_parent_token is not None:
                 raise RuntimeError("CPU GDN MTP verify only supports topk=1.")
 
-            batch_size = query_start_loc.shape[0] - 1
-            seq_len = q.shape[1]
-            if seq_len % batch_size != 0:
-                raise RuntimeError(
-                    f"Invalid CPU GDN MTP verify shape: {seq_len=} {batch_size=}"
-                )
-            draft_token_num = seq_len // batch_size
-
-            num_q_heads = q.shape[2]
-            head_q_dim = q.shape[3]
-            num_v_heads = v.shape[2]
-            head_v_dim = v.shape[3]
-
-            q_mtp = q.view(batch_size, draft_token_num, num_q_heads, head_q_dim)
-            k_mtp = k.view(batch_size, draft_token_num, num_q_heads, head_q_dim)
-            v_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
-            a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
-            b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
-            step_out = fused_sigmoid_gating_delta_rule_update(
+            return cpu_target_verify_gdn_chain(
                 A_log=A_log,
                 dt_bias=dt_bias,
-                q=q_mtp[:, 0:1].transpose(0, 1).contiguous(),
-                k=k_mtp[:, 0:1].transpose(0, 1).contiguous(),
-                v=v_mtp[:, 0:1].transpose(0, 1).contiguous(),
-                a=a_mtp[:, 0].contiguous(),
-                b=b_mtp[:, 0].contiguous(),
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices[:batch_size],
-                cu_seqlens=torch.arange(
-                    0,
-                    batch_size + 1,
-                    dtype=torch.int32,
-                    device=q.device,
-                ),
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
-            intermediate_states_buffer[
-                intermediate_state_indices[:batch_size], 0
-            ].copy_(ssm_states[cache_indices[:batch_size]])
-            outputs = [step_out]
-            if draft_token_num > 1:
-                outputs.extend(
-                    torch.zeros_like(step_out) for _ in range(draft_token_num - 1)
-                )
-
-            return torch.cat(outputs, dim=1).reshape(
-                1, seq_len, num_v_heads, head_v_dim
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
             )
 
         return fused_sigmoid_gating_delta_rule_update(

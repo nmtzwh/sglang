@@ -48,6 +48,48 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def cpu_target_verify_conv1d_chain(
+    mixed_qkv: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: torch.Tensor,
+    activation: str,
+    cache_indices: torch.Tensor,
+    intermediate_conv_window_cache: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    mixed_qkv_by_step = mixed_qkv.view(batch_size, draft_token_num, -1)
+    scratch_indices = torch.arange(
+        batch_size, dtype=torch.int32, device=cache_indices.device
+    )
+    scratch_conv_states = conv_states[
+        cache_indices[:batch_size].to(torch.int64)
+    ].clone()
+
+    mixed_qkv_steps = []
+    for step in range(draft_token_num):
+        step_mixed_qkv = causal_conv1d_update(
+            mixed_qkv_by_step[:, step, :].contiguous(),
+            scratch_conv_states,
+            conv_weights,
+            bias,
+            activation,
+            conv_state_indices=scratch_indices,
+        )
+        intermediate_conv_window_cache[:, step].index_copy_(
+            0,
+            intermediate_state_indices[:batch_size].to(torch.int64),
+            scratch_conv_states,
+        )
+        mixed_qkv_steps.append(step_mixed_qkv)
+
+    return torch.stack(mixed_qkv_steps, dim=1).view(
+        batch_size * draft_token_num, -1
+    )
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -316,25 +358,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             if is_cpu():
-                mixed_qkv_by_step = mixed_qkv.view(batch_size, draft_token_num, -1)
-                root_mixed_qkv = causal_conv1d_update(
-                    mixed_qkv_by_step[:, 0, :].contiguous(),
+                mixed_qkv = cpu_target_verify_conv1d_chain(
+                    mixed_qkv,
                     conv_states,
                     layer.conv_weights,
                     layer.bias,
                     layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
+                    cache_indices,
+                    intermediate_conv_window_cache,
+                    intermediate_state_indices,
+                    batch_size,
+                    draft_token_num,
                 )
-                intermediate_conv_window_cache[
-                    intermediate_state_indices[:batch_size], 0
-                ].copy_(conv_states[cache_indices[:batch_size]])
-                mixed_qkv_steps = [root_mixed_qkv]
-                if draft_token_num > 1:
-                    mixed_qkv_steps.extend(
-                        torch.zeros_like(root_mixed_qkv)
-                        for _ in range(draft_token_num - 1)
-                    )
-                mixed_qkv = torch.stack(mixed_qkv_steps, dim=1).view(seq_len, -1)
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1

@@ -319,6 +319,18 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
+        if is_cpu():
+            track_ssm_h_src = torch.empty((0,), dtype=mamba_cache_indices.dtype)
+            track_ssm_h_dst = torch.empty((0,), dtype=mamba_track_indices.dtype)
+            track_ssm_final_src = mamba_cache_indices[mamba_track_mask]
+            track_ssm_final_dst = mamba_track_indices[mamba_track_mask]
+            return (
+                track_ssm_h_src.to(self.device, non_blocking=True),
+                track_ssm_h_dst.to(self.device, non_blocking=True),
+                track_ssm_final_src.to(self.device, non_blocking=True),
+                track_ssm_final_dst.to(self.device, non_blocking=True),
+            )
+
         # Calculate the number of hidden states per request
         num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
 
