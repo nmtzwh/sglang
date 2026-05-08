@@ -333,6 +333,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+            if str(batch.device) == "cpu":
+                accept_index[:, 1:] = -1
+                accept_length.zero_()
 
         else:
             # apply temperature and get target probs
@@ -716,6 +719,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
+        batch.prefix_lens = (
+            batch.seq_lens_cpu - torch.tensor(batch.extend_lens)
+        ).tolist()
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False

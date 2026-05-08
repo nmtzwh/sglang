@@ -1941,7 +1941,8 @@ class ServerArgs:
 
             assert (
                 is_cuda()
-            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+                or (self.device == "cpu" and self.attention_backend == "intel_amx")
+            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend or CPU devices with Intel AMX backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -2626,10 +2627,6 @@ class ServerArgs:
                     raise ValueError(
                         "CPU speculative decoding currently supports only EAGLE."
                     )
-                if envs.SGLANG_ENABLE_SPEC_V2.get():
-                    raise ValueError(
-                        "CPU EAGLE speculative decoding does not support spec v2."
-                    )
                 if self.attention_backend != "intel_amx":
                     raise ValueError(
                         "CPU EAGLE speculative decoding requires --attention-backend intel_amx."
@@ -2655,10 +2652,16 @@ class ServerArgs:
                 self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
-                self.disable_overlap_schedule = False
-                logger.warning(
-                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
-                )
+                if self.device == "cpu":
+                    self.disable_overlap_schedule = True
+                    logger.warning(
+                        "Spec v2 environment is enabled for CPU EAGLE, but CPU EAGLE uses the non-overlap worker."
+                    )
+                else:
+                    self.disable_overlap_schedule = False
+                    logger.warning(
+                        "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
+                    )
                 if (
                     self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1

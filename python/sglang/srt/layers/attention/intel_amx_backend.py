@@ -40,6 +40,8 @@ class IntelAMXAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
 
+        self._maybe_init_spec_extend_metadata(forward_batch)
+
         bs = forward_batch.batch_size
         attn_logits = torch.zeros(
             (
@@ -56,6 +58,45 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
+
+    def _maybe_init_spec_extend_metadata(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.extend_seq_lens is not None
+            or not forward_batch.forward_mode.is_target_verify()
+            or forward_batch.spec_info is None
+        ):
+            return
+
+        draft_token_num = getattr(forward_batch.spec_info, "draft_token_num", None)
+        if draft_token_num is None:
+            return
+
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+        index_dtype = forward_batch.req_to_token_pool.req_to_token.dtype
+        extend_seq_lens = torch.full(
+            (bs,), draft_token_num, dtype=index_dtype, device=device
+        )
+        extend_start_loc = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=index_dtype,
+            device=device,
+        )
+
+        forward_batch.extend_seq_lens = extend_seq_lens
+        forward_batch.extend_start_loc = extend_start_loc
+        forward_batch.extend_num_tokens = bs * draft_token_num
+        forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(dtype=index_dtype)
+        forward_batch.extend_seq_lens_cpu = [draft_token_num] * bs
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.extend_prefix_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+        else:
+            forward_batch.extend_prefix_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+        forward_batch.extend_logprob_start_lens_cpu = (
+            forward_batch.extend_prefix_lens_cpu
+        )
 
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
@@ -107,6 +148,12 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         _, max_extend_len = self.forward_metadata
 
+        seq_lens = forward_batch.seq_lens
+        if forward_batch.forward_mode.is_target_verify():
+            seq_lens = (
+                forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
+            ).to(dtype=forward_batch.seq_lens.dtype)
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -116,7 +163,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            seq_lens,
             forward_batch.extend_seq_lens,
             forward_batch.extend_start_loc,
             max_extend_len,

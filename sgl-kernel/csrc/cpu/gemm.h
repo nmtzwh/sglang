@@ -2,6 +2,7 @@
 #include <ATen/native/CPUBlas.h>
 
 #include "common.h"
+#include "vec.h"
 
 // amx-bf16 (x86 only)
 #define TILE_M 16

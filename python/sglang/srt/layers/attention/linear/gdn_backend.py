@@ -315,23 +315,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            if is_cpu():
+                mixed_qkv_by_step = mixed_qkv.view(batch_size, draft_token_num, -1)
+                root_mixed_qkv = causal_conv1d_update(
+                    mixed_qkv_by_step[:, 0, :].contiguous(),
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                )
+                intermediate_conv_window_cache[
+                    intermediate_state_indices[:batch_size], 0
+                ].copy_(conv_states[cache_indices[:batch_size]])
+                mixed_qkv_steps = [root_mixed_qkv]
+                if draft_token_num > 1:
+                    mixed_qkv_steps.extend(
+                        torch.zeros_like(root_mixed_qkv)
+                        for _ in range(draft_token_num - 1)
+                    )
+                mixed_qkv = torch.stack(mixed_qkv_steps, dim=1).view(seq_len, -1)
+            else:
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (

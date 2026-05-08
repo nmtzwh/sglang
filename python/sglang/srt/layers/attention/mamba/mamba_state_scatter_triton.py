@@ -117,10 +117,6 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    if not dst.is_cuda or not src.is_cuda:
-        raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
-        )
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -144,6 +140,19 @@ def fused_mamba_state_scatter_with_mask(
     src_req_size = src.shape[1]
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
+
+    if not dst.is_cuda or not src.is_cuda:
+        dst_indices_raw = dst_indices_raw.to(torch.int64)
+        step_indices_raw = step_indices_raw.to(torch.int64)
+        for req_idx in range(step_indices_raw.shape[0]):
+            step_idx = int(step_indices_raw[req_idx].item())
+            if step_idx < 0 or step_idx >= src_step_size or req_idx >= src_req_size:
+                continue
+            dst_idx = int(dst_indices_raw[req_idx].item())
+            if dst_idx < 0 or dst_idx >= dst_req_size:
+                continue
+            dst[:, dst_idx].copy_(src[:, req_idx, step_idx])
+        return
 
     # Flatten trailing dimensions: number of elements per (layer, cache_line) entry.
     elem_per_entry = dst.numel() // (dst.shape[0] * dst.shape[1])

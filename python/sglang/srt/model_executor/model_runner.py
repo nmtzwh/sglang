@@ -2135,6 +2135,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
+        if self.device == "cpu" and not self.spec_algorithm.is_none():
+            logger.warning(
+                "CPU graph is disabled because speculative decoding is enabled."
+            )
+            return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
