@@ -2135,9 +2135,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
-        if self.device == "cpu" and not self.spec_algorithm.is_none():
+        if self.device == "cpu" and self.spec_algorithm.is_eagle():
             logger.warning(
-                "CPU graph is disabled because speculative decoding is enabled."
+                "CPU graph is disabled for EAGLE MTP because target verification is slower under torch.compile."
+            )
+            return
+        if (
+            self.device == "cpu"
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.is_eagle()
+        ):
+            logger.warning(
+                "CPU graph is disabled because this speculative decoding algorithm is not supported."
             )
             return
 
