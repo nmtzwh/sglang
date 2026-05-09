@@ -49,6 +49,168 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
 
 
+def top_k_renorm_prob_cpu(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+) -> torch.Tensor:
+    if probs.device.type != "cpu":
+        raise ValueError("top_k_renorm_prob_cpu expects CPU tensors.")
+
+    probs = probs.float()
+    top_k = top_k.to(device=probs.device, dtype=torch.int64).view(-1)
+    renorm_probs = torch.zeros_like(probs)
+    vocab_size = probs.shape[-1]
+
+    for i in range(probs.shape[0]):
+        k = int(top_k[i].item())
+        if k <= 0 or k >= vocab_size:
+            row = probs[i]
+            denom = row.sum()
+            renorm_probs[i] = row / denom if denom > 0 else row
+            continue
+
+        values, indices = torch.topk(probs[i], k=k, dim=-1)
+        denom = values.sum()
+        if denom > 0:
+            renorm_probs[i].scatter_(0, indices, values / denom)
+
+    return renorm_probs
+
+
+def top_p_renorm_prob_cpu(
+    probs: torch.Tensor,
+    top_p: torch.Tensor,
+) -> torch.Tensor:
+    if probs.device.type != "cpu":
+        raise ValueError("top_p_renorm_prob_cpu expects CPU tensors.")
+
+    probs = probs.float()
+    top_p = top_p.to(device=probs.device, dtype=torch.float32).view(-1)
+    renorm_probs = torch.zeros_like(probs)
+
+    for i in range(probs.shape[0]):
+        p = float(top_p[i].item())
+        if p >= 1.0:
+            row = probs[i]
+            denom = row.sum()
+            renorm_probs[i] = row / denom if denom > 0 else row
+            continue
+
+        sorted_probs, sorted_indices = torch.sort(probs[i], descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        keep = cumulative_probs <= p
+        if keep.numel() > 0:
+            keep[0] = True
+            first_over = torch.nonzero(cumulative_probs > p, as_tuple=False)
+            if first_over.numel() > 0:
+                keep[int(first_over[0].item())] = True
+
+        kept_probs = sorted_probs[keep]
+        kept_indices = sorted_indices[keep]
+        denom = kept_probs.sum()
+        if denom > 0:
+            renorm_probs[i].scatter_(0, kept_indices, kept_probs / denom)
+
+    return renorm_probs
+
+
+def _sample_from_probs_cpu(probs: torch.Tensor, coin: float) -> int:
+    total = float(probs.sum().item())
+    if total <= 0:
+        return probs.shape[0] - 1
+
+    threshold = coin * total
+    cumulative = torch.cumsum(probs, dim=-1)
+    selected = torch.nonzero(cumulative > threshold, as_tuple=False)
+    if selected.numel() == 0:
+        return probs.shape[0] - 1
+    return int(selected[0].item())
+
+
+def tree_speculative_sampling_target_only_cpu(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
+) -> None:
+    del deterministic
+    if target_probs.device.type != "cpu":
+        raise ValueError("tree_speculative_sampling_target_only_cpu expects CPU tensors.")
+
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+    threshold_acc = max(float(threshold_acc), 1e-9)
+
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
+
+    for bx in range(batch_size):
+        prob_acc = 0.0
+        cur_prob_index = 0
+        coin = float(uniform_samples[bx, 0].item())
+        last_accepted_retrive_idx = int(retrive_index[bx, 0].item())
+        accept_index[bx, 0] = last_accepted_retrive_idx
+        num_accepted_tokens = 0
+        cur_index = 0
+
+        for _ in range(1, num_speculative_tokens):
+            cur_index = int(retrive_next_token[bx, cur_index].item())
+            while cur_index != -1:
+                draft_index = int(retrive_index[bx, cur_index].item())
+                draft_token_id = int(candidates[bx, cur_index].item())
+                target_prob_single = float(
+                    target_probs[bx, cur_prob_index, draft_token_id].item()
+                )
+                prob_acc += target_prob_single
+
+                if (
+                    coin <= prob_acc / threshold_acc
+                    or target_prob_single >= threshold_single
+                ):
+                    prob_acc = 0.0
+                    cur_prob_index = cur_index
+                    coin = float(uniform_samples[bx, cur_index].item())
+                    predicts[last_accepted_retrive_idx] = draft_token_id
+                    num_accepted_tokens += 1
+                    accept_index[bx, num_accepted_tokens] = draft_index
+                    last_accepted_retrive_idx = draft_index
+                    break
+
+                draft_probs[bx, cur_prob_index, draft_token_id] = target_probs[
+                    bx, cur_prob_index, draft_token_id
+                ]
+                cur_index = int(retrive_next_sibling[bx, cur_index].item())
+
+            if cur_index == -1:
+                break
+
+        accept_token_num[bx] = num_accepted_tokens
+
+        if num_accepted_tokens == num_speculative_tokens - 1:
+            final_probs = target_probs[bx, cur_prob_index]
+        else:
+            final_probs = torch.clamp(
+                target_probs[bx, cur_prob_index] - draft_probs[bx, cur_prob_index],
+                min=0,
+            )
+        sampled_id = _sample_from_probs_cpu(
+            final_probs, float(uniform_samples_for_final_sampling[bx].item())
+        )
+        predicts[last_accepted_retrive_idx] = sampled_id
+
+
 class _DeviceDispatchKernel:
     def __init__(self, triton_kernel, cpu_func):
         self.triton_kernel = triton_kernel

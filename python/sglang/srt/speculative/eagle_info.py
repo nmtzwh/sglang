@@ -38,6 +38,9 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    top_k_renorm_prob_cpu,
+    top_p_renorm_prob_cpu,
+    tree_speculative_sampling_target_only_cpu,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
 
@@ -309,17 +312,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
-        if str(batch.device) == "cpu" and not is_all_greedy:
-            raise ValueError(
-                "CPU EAGLE speculative decoding only supports greedy sampling."
-            )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
-            )
+            if str(batch.device) != "cpu":
+                logger.warning(
+                    "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                    "Falling back to greedy verification."
+                )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+        if is_all_greedy or (
+            not TREE_SPEC_KERNEL_AVAILABLE and str(batch.device) != "cpu"
+        ):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
@@ -343,14 +345,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
+            top_k_renorm = (
+                top_k_renorm_prob_cpu
+                if str(batch.device) == "cpu"
+                else top_k_renorm_prob
+            )
+            top_p_renorm = (
+                top_p_renorm_prob_cpu
+                if str(batch.device) == "cpu"
+                else top_p_renorm_prob
+            )
+            target_probs = top_k_renorm(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
             if not torch.all(sampling_info.top_ps == 1.0):
-                target_probs = top_p_renorm_prob(
+                target_probs = top_p_renorm(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
@@ -370,22 +382,40 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
-                deterministic=True,
-            )
+            if str(batch.device) == "cpu":
+                tree_speculative_sampling_target_only_cpu(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=coins_for_final_sampling,
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                    threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                    deterministic=True,
+                )
+            else:
+                tree_speculative_sampling_target_only(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=coins_for_final_sampling,
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                    threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                    deterministic=True,
+                )
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation

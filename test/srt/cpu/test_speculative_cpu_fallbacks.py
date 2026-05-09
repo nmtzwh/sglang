@@ -64,6 +64,9 @@ from sglang.srt.speculative.spec_utils import (
     align_evict_mask_to_page_size,
     assign_draft_cache_locs,
     create_extend_after_decode_spec_info,
+    top_k_renorm_prob_cpu,
+    top_p_renorm_prob_cpu,
+    tree_speculative_sampling_target_only_cpu,
 )
 from sglang.srt.utils import next_power_of_2
 
@@ -337,6 +340,110 @@ def test_verify_tree_greedy_func_cpu_topk1():
     assert accept_index.tolist() == [[0, 1, -1], [3, 4, 5]]
     assert accept_token_num.tolist() == [1, 2]
     assert predicts[:6].tolist() == [11, 99, -1, 21, 22, 23]
+
+
+def test_cpu_top_k_top_p_renorm_probs():
+    probs = torch.tensor(
+        [
+            [0.05, 0.15, 0.30, 0.50],
+            [0.40, 0.30, 0.20, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+
+    top_k = top_k_renorm_prob_cpu(probs, torch.tensor([2, 3], dtype=torch.int32))
+    torch.testing.assert_close(
+        top_k,
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.3750, 0.6250],
+                [0.44444445, 0.33333334, 0.22222222, 0.0],
+            ]
+        ),
+    )
+
+    top_p = top_p_renorm_prob_cpu(probs, torch.tensor([0.6, 0.5]))
+    torch.testing.assert_close(
+        top_p,
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.3750, 0.6250],
+                [0.5714286, 0.42857143, 0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_tree_speculative_sampling_target_only_cpu_fixture_values():
+    candidates = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [7, 8, 9, 10, 11, 12],
+        ],
+        dtype=torch.int64,
+    )
+    retrive_index = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11],
+        ],
+        dtype=torch.int64,
+    )
+    retrive_next_token = torch.tensor(
+        [
+            [1, 2, -1, 4, 5, -1],
+            [4, 2, 3, -1, 5, -1],
+        ],
+        dtype=torch.int64,
+    )
+    retrive_next_sibling = torch.tensor(
+        [
+            [-1, 3, -1, -1, -1, -1],
+            [-1, -1, -1, -1, 1, -1],
+        ],
+        dtype=torch.int64,
+    )
+
+    target_logits = torch.full((2, 6, 20), 1, dtype=torch.float32)
+    target_logits[0, 0, 3] = 10
+    target_logits[0, 3, 4] = 10
+    target_logits[0, 4, 5] = 10
+    target_logits[1, 0, 11] = 10
+    target_logits[1, 4, 12] = 10
+    for i in range(target_logits.shape[0]):
+        for j in range(target_logits.shape[1]):
+            if torch.max(target_logits[i, j]) < 10:
+                target_logits[i, j, 18] = 10
+
+    target_probs = torch.softmax(target_logits / 0.01, dim=-1)
+    draft_probs = torch.zeros_like(target_probs)
+    coins = torch.full((2, 6), 0.5, dtype=torch.float32)
+    coins_for_final_sampling = torch.full((2,), 0.5, dtype=torch.float32)
+
+    predicts = torch.full((12,), -1, dtype=torch.int32)
+    accept_index = torch.full((2, 4), -1, dtype=torch.int32)
+    accept_token_num = torch.zeros((2,), dtype=torch.int32)
+
+    tree_speculative_sampling_target_only_cpu(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=coins_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert predicts.tolist() == [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
+    assert accept_index.tolist() == [[0, 3, 4, 5], [6, 10, 11, -1]]
+    assert accept_token_num.tolist() == [3, 2]
 
 
 def test_cpu_target_verify_conv1d_chain_saves_all_steps(monkeypatch):

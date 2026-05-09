@@ -952,21 +952,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 name in sampling_kwargs for name in ("temperature", "top_k", "top_p")
             ):
                 sampling_kwargs = {**sampling_kwargs, "temperature": 0.0}
-            elif (
-                sampling_kwargs.get("temperature", 0.0) != 0
-                or sampling_kwargs.get("top_p", 1.0) != 1.0
-                or sampling_kwargs.get("top_k", 1) not in (-1, 1)
-            ):
-                logger.warning(
-                    "CPU EAGLE speculative decoding only supports greedy sampling. "
-                    "Forcing temperature=0 for this request."
-                )
-                sampling_kwargs = {
-                    **sampling_kwargs,
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "top_k": 1,
-                }
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
