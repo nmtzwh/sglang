@@ -27,6 +27,7 @@ runtime_common = [
   "decord2",
   "datasets",
   "einops",
+  "easydict",
   "fastapi",
   "gguf",
   "hf_transfer",
@@ -60,13 +61,12 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "mistral_common>=1.11.0",
+  "transformers==5.6.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.4.1",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
+  "xgrammar==0.2.0",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 tracing = [
@@ -88,7 +88,7 @@ srt_hip = [
 diffusion_hip = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  "diffusers==0.36.0",
+  "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
@@ -121,7 +121,7 @@ srt_musa = [
 diffusion_musa = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  "diffusers==0.36.0",
+  "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
@@ -144,7 +144,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft",
+  "peft>=0.18.0,<0.19.0",
   "pytest",
   "sentence_transformers",
   "tabulate",
