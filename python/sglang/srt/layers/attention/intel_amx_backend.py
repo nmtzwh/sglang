@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -101,6 +103,78 @@ class IntelAMXAttnBackend(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
+    def _forward_cached_kv_torch(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor | None = None,
+        extend_start_loc: torch.Tensor | None = None,
+    ):
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+
+        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+        kv_repeat = layer.tp_q_head_num // layer.tp_k_head_num if use_gqa else 1
+
+        for seq_idx in range(seq_lens.shape[0]):
+            seq_len_kv = int(seq_lens[seq_idx].item())
+            if seq_len_kv == 0:
+                continue
+
+            if extend_seq_lens is None:
+                start_q = seq_idx
+                seq_len_q = 1
+                prefix_len = seq_len_kv
+            else:
+                start_q = int(extend_start_loc[seq_idx].item())
+                seq_len_q = int(extend_seq_lens[seq_idx].item())
+                prefix_len = seq_len_kv - seq_len_q
+                if seq_len_q == 0:
+                    continue
+
+            end_q = start_q + seq_len_q
+            req_pool_idx = req_pool_indices[seq_idx]
+            token_indices = req_to_token[req_pool_idx, :seq_len_kv].to(torch.long)
+
+            per_req_q = q[start_q:end_q].transpose(0, 1).unsqueeze(0)
+            per_req_k = k_buffer[token_indices].transpose(0, 1).unsqueeze(0)
+            per_req_v = v_buffer[token_indices].transpose(0, 1).unsqueeze(0)
+
+            if use_gqa:
+                per_req_k = per_req_k.repeat_interleave(kv_repeat, dim=1)
+                per_req_v = per_req_v.repeat_interleave(kv_repeat, dim=1)
+
+            attn_mask = None
+            if (
+                extend_seq_lens is not None
+                and not layer.is_cross_attention
+                and layer.attn_type != AttentionType.ENCODER_ONLY
+            ):
+                q_pos = torch.arange(
+                    prefix_len,
+                    prefix_len + seq_len_q,
+                    device=q.device,
+                )
+                kv_pos = torch.arange(seq_len_kv, device=q.device)
+                attn_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+            per_req_o = F.scaled_dot_product_attention(
+                per_req_q,
+                per_req_k,
+                per_req_v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=layer.scaling,
+            )
+            o[start_q:end_q].copy_(per_req_o.squeeze(0).transpose(0, 1))
+
     def init_forward_metadata_capture_cpu_graph(
         self,
         bs: int,
@@ -154,22 +228,33 @@ class IntelAMXAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
             ).to(dtype=forward_batch.seq_lens.dtype)
 
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k,
-            v,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
+        if k is None or v is None:
+            self._forward_cached_kv_torch(
+                q,
+                o,
+                layer,
+                forward_batch,
+                seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+            )
+        else:
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k,
+                v,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
         return o
 
     def forward_decode(
@@ -190,21 +275,26 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k,
-            v,
-            forward_batch.out_cache_loc,
-            attn_logits,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            layer.scaling,
-            layer.logit_cap,
-        )
+        if k is None or v is None:
+            self._forward_cached_kv_torch(
+                q, o, layer, forward_batch, forward_batch.seq_lens
+            )
+        else:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                k,
+                v,
+                forward_batch.out_cache_loc,
+                attn_logits,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                layer.scaling,
+                layer.logit_cap,
+            )
 
         return o
 

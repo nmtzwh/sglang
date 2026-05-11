@@ -530,6 +530,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2672,6 +2673,30 @@ class ServerArgs:
             )
 
         if self.speculative_algorithm == "FROZEN_KV_MTP":
+            model_config = self.get_model_config()
+            hf_config = model_config.hf_config
+
+            if self.device == "cpu":
+                model_arch = hf_config.architectures[0]
+                if model_arch != "Gemma4ForCausalLM":
+                    raise ValueError(
+                        "CPU Frozen-KV MTP currently supports text-only "
+                        f"Gemma4ForCausalLM, got {model_arch}."
+                    )
+                if getattr(hf_config, "enable_moe_block", False):
+                    raise ValueError(
+                        "CPU Frozen-KV MTP currently supports dense Gemma4 only; "
+                        "Gemma4 MoE is not supported."
+                    )
+                if self.attention_backend != "intel_amx":
+                    raise ValueError(
+                        "CPU Frozen-KV MTP requires --attention-backend intel_amx."
+                    )
+                if self.speculative_eagle_topk != 1:
+                    raise ValueError(
+                        "CPU Frozen-KV MTP requires --speculative-eagle-topk 1."
+                    )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -4451,6 +4476,12 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-skip-dp-mlp-sync",
+            action="store_true",
+            default=ServerArgs.speculative_skip_dp_mlp_sync,
+            help="Skip DP MLP synchronization in EAGLE speculative decoding.",
         )
 
         # Speculative decoding (ngram)
