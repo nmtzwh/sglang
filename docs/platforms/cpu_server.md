@@ -213,6 +213,42 @@ Notes:
 4. A warmup step is automatically triggered when the service is started.
     The server is ready when you see the log `The server is fired up and ready to roll!`.
 
+### Gemma4 Frozen-KV MTP on CPU
+
+Gemma4 text-only dense models can use Frozen-KV MTP speculative decoding on
+Intel AMX CPU servers. The CPU path is currently scoped to the `intel_amx`
+attention backend, top-k 1 draft expansion, and eager execution. Disable CPU
+graph mode for this configuration.
+
+Example launch command:
+
+```bash
+SGLANG_USE_CPU_ENGINE=1 python -m sglang.launch_server \
+    --model <GEMMA4_TEXT_TARGET_MODEL_OR_PATH> \
+    --speculative-draft-model-path <GEMMA4_ASSISTANT_MODEL_OR_PATH> \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --device cpu \
+    --attention-backend intel_amx \
+    --disable-cuda-graph
+```
+
+`NEXTN` and `EAGLE` are promoted to the Frozen-KV MTP path when the draft model
+uses the `Gemma4AssistantForCausalLM` architecture. Multimodal Gemma4 models,
+Gemma4 MoE, overlap/spec-v2 scheduling, top-k greater than 1, and CPU graph mode
+are not supported for this CPU MTP path yet.
+
+The manual AMX validation harness is available at
+`test/manual/models/test_gemma4_mtp_cpu.py`:
+
+```bash
+SGLANG_GEMMA4_CPU_TARGET=<GEMMA4_TEXT_TARGET_MODEL_OR_PATH> \
+SGLANG_GEMMA4_CPU_ASSISTANT=<GEMMA4_ASSISTANT_MODEL_OR_PATH> \
+PYTHONPATH=python python3 -m unittest test.manual.models.test_gemma4_mtp_cpu
+```
+
 ## Benchmarking with Requests
 
 You can benchmark the performance via the `bench_serving` script.
