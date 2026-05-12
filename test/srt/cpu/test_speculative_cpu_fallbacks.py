@@ -68,6 +68,7 @@ from sglang.srt.speculative.spec_utils import (
     top_p_renorm_prob_cpu,
     tree_speculative_sampling_target_only_cpu,
 )
+from sglang.srt.speculative.spec_info import maybe_force_cpu_eagle_greedy_sampling
 from sglang.srt.utils import next_power_of_2
 
 
@@ -194,6 +195,17 @@ def test_assign_draft_cache_locs_cpu_topk1_page_size_1():
     assert req_to_token[0, 2:5].tolist() == [10, 11, 12]
     assert req_to_token[1, 4:7].tolist() == [20, 21, 22]
     assert out_cache_loc.tolist() == [10, 11, 12, 20, 21, 22]
+
+
+def test_cpu_eagle_sampling_default_does_not_force_frozen_kv_mtp_greedy():
+    assert maybe_force_cpu_eagle_greedy_sampling("cpu", "EAGLE", {}) == {
+        "temperature": 0.0
+    }
+    assert maybe_force_cpu_eagle_greedy_sampling("cpu", "FROZEN_KV_MTP", {}) == {}
+    assert maybe_force_cpu_eagle_greedy_sampling(
+        "cpu", "EAGLE", {"temperature": 0.7}
+    ) == {"temperature": 0.7}
+    assert maybe_force_cpu_eagle_greedy_sampling("cuda", "EAGLE", {}) == {}
 
 
 def test_assign_draft_cache_locs_cpu_topk1_page_size_gt_1():

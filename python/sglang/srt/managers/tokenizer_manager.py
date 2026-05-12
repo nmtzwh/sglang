@@ -98,7 +98,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import maybe_force_cpu_eagle_greedy_sampling
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -944,18 +944,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            self.server_args.speculative_algorithm
+        sampling_kwargs = maybe_force_cpu_eagle_greedy_sampling(
+            self.server_args.device,
+            self.server_args.speculative_algorithm,
+            sampling_kwargs,
         )
-        if (
-            self.server_args.device == "cpu"
-            and speculative_algorithm.is_eagle()
-            and not speculative_algorithm.is_frozen_kv_mtp()
-        ):
-            if not any(
-                name in sampling_kwargs for name in ("temperature", "top_k", "top_p")
-            ):
-                sampling_kwargs = {**sampling_kwargs, "temperature": 0.0}
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)

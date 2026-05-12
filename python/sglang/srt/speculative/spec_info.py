@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -129,6 +129,22 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+def maybe_force_cpu_eagle_greedy_sampling(
+    device: str, speculative_algorithm: str, sampling_kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    speculative_algorithm = SpeculativeAlgorithm.from_string(speculative_algorithm)
+    if (
+        device == "cpu"
+        and speculative_algorithm.is_eagle()
+        and not speculative_algorithm.is_frozen_kv_mtp()
+    ):
+        if not any(
+            name in sampling_kwargs for name in ("temperature", "top_k", "top_p")
+        ):
+            return {**sampling_kwargs, "temperature": 0.0}
+    return sampling_kwargs
 
 
 class SpecInputType(IntEnum):
