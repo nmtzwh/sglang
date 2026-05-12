@@ -947,7 +947,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             self.server_args.speculative_algorithm
         )
-        if self.server_args.device == "cpu" and speculative_algorithm.is_eagle():
+        if (
+            self.server_args.device == "cpu"
+            and speculative_algorithm.is_eagle()
+            and not speculative_algorithm.is_frozen_kv_mtp()
+        ):
             if not any(
                 name in sampling_kwargs for name in ("temperature", "top_k", "top_p")
             ):

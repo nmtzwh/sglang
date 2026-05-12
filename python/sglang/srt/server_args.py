@@ -2692,9 +2692,27 @@ class ServerArgs:
                     raise ValueError(
                         "CPU Frozen-KV MTP requires --attention-backend intel_amx."
                     )
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
                 if self.speculative_eagle_topk != 1:
                     raise ValueError(
                         "CPU Frozen-KV MTP requires --speculative-eagle-topk 1."
+                    )
+                if self.speculative_num_steps is None:
+                    raise ValueError(
+                        "CPU Frozen-KV MTP requires --speculative-num-steps."
+                    )
+                if (
+                    self.speculative_num_draft_tokens is None
+                    or self.speculative_num_draft_tokens
+                    != self.speculative_num_steps + 1
+                ):
+                    self.speculative_num_draft_tokens = (
+                        self.speculative_num_steps + 1
+                    )
+                    logger.warning(
+                        "speculative_num_draft_tokens is adjusted to "
+                        "speculative_num_steps + 1 for CPU Frozen-KV MTP."
                     )
 
             if self.max_running_requests is None:

@@ -103,6 +103,71 @@ class IntelAMXAttnBackend(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
+    def _get_req_to_token_for_layer(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        return self._maybe_translate_full_to_swa(layer, forward_batch, req_to_token)
+
+    def _get_cache_loc_for_layer(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        cache_loc = self._maybe_translate_full_to_swa(
+            layer, forward_batch, forward_batch.out_cache_loc
+        )
+        return cache_loc.to(dtype=forward_batch.out_cache_loc.dtype)
+
+    def _maybe_translate_full_to_swa(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        loc: torch.Tensor,
+    ) -> torch.Tensor:
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        layers_mapping = getattr(token_to_kv_pool, "layers_mapping", None)
+        if layers_mapping is None:
+            return loc
+
+        layer_mapping = layers_mapping.get(layer.layer_id)
+        if layer_mapping is None:
+            return loc
+        _, is_swa_layer = layer_mapping
+        if not is_swa_layer:
+            return loc
+
+        return token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+
+    def _use_torch_cached_kv(self, layer: RadixAttention, k, v) -> bool:
+        return (
+            k is None
+            or v is None
+            or (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+            )
+        )
+
+    def _get_decode_attn_logits(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        attn_logits, _ = self.forward_metadata
+        if (
+            attn_logits.size(1) == layer.tp_q_head_num
+            and attn_logits.size(3) == layer.v_head_dim + 1
+        ):
+            return attn_logits
+
+        return torch.zeros(
+            (
+                forward_batch.batch_size,
+                layer.tp_q_head_num,
+                attn_logits.size(2),
+                layer.v_head_dim + 1,
+            ),
+            dtype=attn_logits.dtype,
+            device=attn_logits.device,
+        )
+
     def _forward_cached_kv_torch(
         self,
         q: torch.Tensor,
@@ -117,7 +182,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_to_token = self._get_req_to_token_for_layer(layer, forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
@@ -153,17 +218,36 @@ class IntelAMXAttnBackend(AttentionBackend):
 
             attn_mask = None
             if (
-                extend_seq_lens is not None
-                and not layer.is_cross_attention
+                not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
-            ):
-                q_pos = torch.arange(
-                    prefix_len,
-                    prefix_len + seq_len_q,
-                    device=q.device,
+                and (
+                    extend_seq_lens is not None
+                    or (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                    )
                 )
+            ):
+                if extend_seq_lens is None:
+                    q_pos = torch.full(
+                        (seq_len_q,), seq_len_kv - 1, device=q.device
+                    )
+                else:
+                    q_pos = torch.arange(
+                        prefix_len,
+                        prefix_len + seq_len_q,
+                        device=q.device,
+                    )
                 kv_pos = torch.arange(seq_len_kv, device=q.device)
                 attn_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    attn_mask = attn_mask & (
+                        kv_pos.unsqueeze(0)
+                        >= q_pos.unsqueeze(1) - layer.sliding_window_size
+                    )
 
             per_req_o = F.scaled_dot_product_attention(
                 per_req_q,
@@ -228,7 +312,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
             ).to(dtype=forward_batch.seq_lens.dtype)
 
-        if k is None or v is None:
+        if self._use_torch_cached_kv(layer, k, v):
             self._forward_cached_kv_torch(
                 q,
                 o,
@@ -246,7 +330,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                forward_batch.req_to_token_pool.req_to_token,
+                self._get_req_to_token_for_layer(layer, forward_batch),
                 forward_batch.req_pool_indices,
                 seq_lens,
                 forward_batch.extend_seq_lens,
@@ -266,8 +350,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        attn_logits, _ = self.forward_metadata
-
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -275,7 +357,11 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        if k is None or v is None:
+        if self._use_torch_cached_kv(layer, k, v):
+            if save_kv_cache and k is not None and v is not None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
             self._forward_cached_kv_torch(
                 q, o, layer, forward_batch, forward_batch.seq_lens
             )
@@ -287,9 +373,9 @@ class IntelAMXAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 k,
                 v,
-                forward_batch.out_cache_loc,
-                attn_logits,
-                forward_batch.req_to_token_pool.req_to_token,
+                self._get_cache_loc_for_layer(layer, forward_batch),
+                self._get_decode_attn_logits(layer, forward_batch),
+                self._get_req_to_token_for_layer(layer, forward_batch),
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 layer.scaling,

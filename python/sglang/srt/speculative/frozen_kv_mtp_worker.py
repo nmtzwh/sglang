@@ -523,7 +523,9 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         draft_input = batch.spec_info
         seq_lens_backup = batch.seq_lens.clone()
-        seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
+        seq_lens_cpu_backup = (
+            batch.seq_lens_cpu.clone() if batch.seq_lens_cpu is not None else None
+        )
         req_pool_indices_backup = batch.req_pool_indices
 
         try:
