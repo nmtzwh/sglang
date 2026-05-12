@@ -127,3 +127,41 @@ def test_gemma4_conditional_generation_disables_multimodal_by_default(monkeypatc
 
     assert not config.is_multimodal
     assert config.is_generation
+    assert config.hf_config.architectures == ["Gemma4ForCausalLM"]
+
+
+def test_gemma4_conditional_generation_preserves_multimodal_when_enabled(monkeypatch):
+    model_config = _load_model_config(monkeypatch)
+    cfg = SimpleNamespace(
+        architectures=["Gemma4ForConditionalGeneration"],
+        model_type="gemma4",
+        vision_config=SimpleNamespace(),
+        audio_config=None,
+    )
+
+    monkeypatch.setattr(model_config, "get_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(model_config, "get_hf_text_config", lambda config: config)
+    monkeypatch.setattr(
+        model_config, "get_generation_config", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(model_config, "_get_and_verify_dtype", lambda *args: "float32")
+    for name in [
+        "_validate_quantize_and_serve_config",
+        "_maybe_pull_model_tokenizer_from_remote",
+        "_config_draft_model",
+        "_derive_context_length",
+        "_derive_model_shapes",
+        "_derive_hybrid_model",
+        "_verify_quantization",
+        "_verify_transformers_version",
+        "_verify_dual_chunk_attention_config",
+    ]:
+        monkeypatch.setattr(model_config.ModelConfig, name, lambda self, *args: None)
+    monkeypatch.setattr(
+        model_config.ModelConfig, "_get_hf_eos_token_id", lambda self: None
+    )
+
+    config = model_config.ModelConfig("gemma4", enable_multimodal=True)
+
+    assert config.is_multimodal
+    assert config.hf_config.architectures == ["Gemma4ForConditionalGeneration"]

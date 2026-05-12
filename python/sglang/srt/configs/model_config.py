@@ -155,6 +155,12 @@ class ModelConfig:
             else:
                 enable_multimodal = True
 
+        if (
+            not enable_multimodal
+            and self.hf_config.architectures[0] == "Gemma4ForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Gemma4ForCausalLM"
+
         # Config draft model
         self._config_draft_model()
 

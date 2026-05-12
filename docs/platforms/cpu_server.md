@@ -220,6 +220,11 @@ Intel AMX CPU servers. The CPU path is currently scoped to the `intel_amx`
 attention backend, top-k 1 draft expansion, and eager execution. Disable CPU
 graph mode for this configuration.
 
+Gemma4 multimodal configs are treated as text-only by default on CPU: if
+multimodal support is not explicitly enabled, `Gemma4ForConditionalGeneration`
+is dispatched through the `Gemma4ForCausalLM` text model path and the multimodal
+processor is not initialized.
+
 Example launch command:
 
 ```bash
