@@ -187,6 +187,7 @@ class TestGemma4MTPCPU(unittest.TestCase):
         mtp = self._launch(self._mtp_args())
         try:
             info = _server_info(self.base_url)
+            self.assertEqual(info.get("speculative_algorithm"), "FROZEN_KV_MTP")
             self.assertEqual(info.get("speculative_eagle_topk"), 1)
             self.assertTrue(info.get("disable_cuda_graph"))
             mtp_outputs = [
@@ -209,6 +210,8 @@ class TestGemma4MTPCPU(unittest.TestCase):
     def test_sampling_request_runs_with_mtp(self) -> None:
         mtp = self._launch(self._mtp_args())
         try:
+            info = _server_info(self.base_url)
+            self.assertEqual(info.get("speculative_algorithm"), "FROZEN_KV_MTP")
             for prompt in _prompts()[:1]:
                 output = _completion(self.base_url, prompt, temperature=0.7)
                 self.assertTrue(output.strip())

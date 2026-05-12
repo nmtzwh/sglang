@@ -288,8 +288,10 @@ def _resolve_speculative_algorithm_alias(
         cfg = AutoConfig.from_pretrained(
             speculative_draft_model_path, trust_remote_code=trust_remote_code
         )
-        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
-            getattr(cfg, "architectures", None) or []
+        architectures = getattr(cfg, "architectures", None) or []
+        is_gemma4_draft = (
+            "Gemma4AssistantForCausalLM" in architectures
+            or getattr(cfg, "model_type", None) == "gemma4_assistant"
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:

@@ -177,6 +177,30 @@ def test_gemma4_assistant_draft_promotes_nextn_and_eagle(monkeypatch):
         server_args._resolve_speculative_algorithm_alias("EAGLE3", "draft")
 
 
+def test_gemma4_assistant_draft_promotes_by_model_type(monkeypatch):
+    server_args = _load_server_args(monkeypatch)
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return SimpleNamespace(architectures=[], model_type="gemma4_assistant")
+
+    transformers = types.ModuleType("transformers")
+    transformers.AutoConfig = AutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert (
+        server_args._resolve_speculative_algorithm_alias("NEXTN", "draft")
+        == "FROZEN_KV_MTP"
+    )
+    assert (
+        server_args._resolve_speculative_algorithm_alias("EAGLE", "draft")
+        == "FROZEN_KV_MTP"
+    )
+    with pytest.raises(ValueError, match="EAGLE3"):
+        server_args._resolve_speculative_algorithm_alias("EAGLE3", "draft")
+
+
 def _cpu_frozen_kv_args(server_args):
     args = server_args.ServerArgs.__new__(server_args.ServerArgs)
     args.speculative_draft_model_path = None

@@ -60,6 +60,13 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def _get_sgl_kernel_cpu_op(op_name: str):
+    sgl_kernel_ops = getattr(torch.ops, "sgl_kernel", None)
+    if sgl_kernel_ops is None:
+        return None
+    return getattr(sgl_kernel_ops, op_name, None)
+
+
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -78,7 +85,10 @@ class SiluAndMul(MultiPlatformOp):
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+        op = _get_sgl_kernel_cpu_op("silu_and_mul_cpu")
+        if op is not None:
+            return op(x)
+        return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         out = torch_npu.npu_swiglu(x)
@@ -115,11 +125,14 @@ class GeluAndMul(MultiPlatformOp):
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if self.approximate == "tanh":
-            return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+            op = _get_sgl_kernel_cpu_op("gelu_tanh_and_mul_cpu")
+            if op is not None:
+                return op(x)
         elif self.approximate == "none":
-            return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
-        else:
-            return self.forward_native(x)
+            op = _get_sgl_kernel_cpu_op("gelu_and_mul_cpu")
+            if op is not None:
+                return op(x)
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)

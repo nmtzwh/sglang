@@ -134,6 +134,13 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_gemma4_text_model_type_uses_gemma4_chat_handling(self):
+        self.tm.model_config.hf_config.model_type = "gemma4_text"
+
+        serving_chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.assertTrue(serving_chat.is_gemma4)
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

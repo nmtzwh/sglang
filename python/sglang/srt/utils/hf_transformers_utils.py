@@ -133,7 +133,7 @@ def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
     """
-    if config.architectures is not None:
+    if config.architectures:
         class_name = config.architectures[0]
         if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
             # We support non-hf version of llava models, so we do not want to
@@ -322,10 +322,7 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
 
-    if (
-        config.architectures is not None
-        and config.architectures[0] == "Phi4MMForCausalLM"
-    ):
+    if config.architectures and config.architectures[0] == "Phi4MMForCausalLM":
         # Phi4MMForCausalLM uses a hard-coded vision_config. See:
         # https://github.com/vllm-project/vllm/blob/6071e989df1531b59ef35568f83f7351afb0b51e/vllm/model_executor/models/phi4mm.py#L71
         # We set it here to support cases where num_attention_heads is not divisible by the TP size.
@@ -354,6 +351,8 @@ def get_config(
             if not hasattr(config, key) and val is not None:
                 setattr(config, key, val)
 
+    model_type = getattr(config, "model_type", None)
+
     if _is_deepseek_ocr2_model(config):
         _override_v_head_dim_if_zero(config)
         # Temporary hack for load deepseek-ocr2
@@ -363,8 +362,7 @@ def get_config(
         _override_v_head_dim_if_zero(config)
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         setattr(config, "_name_or_path", model)
-    elif config.model_type in _CONFIG_REGISTRY:
-        model_type = config.model_type
+    elif model_type in _CONFIG_REGISTRY:
         if model_type == "deepseek_vl_v2":
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
                 model_type = "deepseek-ocr"
@@ -381,20 +379,36 @@ def get_config(
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
 
-    if isinstance(model, str) and config.model_type == "internvl_chat":
+    model_type = getattr(config, "model_type", None)
+
+    if isinstance(model, str) and model_type == "internvl_chat":
         for key, val in config.llm_config.__dict__.items():
             if not hasattr(config, key):
                 setattr(config, key, val)
 
-    if config.model_type == "multi_modality":
+    if model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
 
-    if config.model_type in ("gemma4", "gemma4_assistant"):
+    is_gemma4_text = model_type in ("gemma4", "gemma4_text")
+
+    if is_gemma4_text and not config.architectures:
+        if (
+            getattr(config, "vision_config", None) is not None
+            or getattr(config, "audio_config", None) is not None
+        ):
+            config.update({"architectures": ["Gemma4ForConditionalGeneration"]})
+        else:
+            config.update({"architectures": ["Gemma4ForCausalLM"]})
+
+    if model_type == "gemma4_assistant" and not config.architectures:
+        config.update({"architectures": ["Gemma4AssistantForCausalLM"]})
+
+    if is_gemma4_text or model_type == "gemma4_assistant":
         # Gemma4 configs use base attributes for SWA layers and `global_*`
         # variants for full-attention layers.  SGLang expects the opposite:
         # base = full-attention, `swa_*` = sliding-window overrides.
         # Remap here so the rest of the stack sees a uniform convention.
-        text_config = config.text_config
+        text_config = get_hf_text_config(config)
         global_head_dim = getattr(text_config, "global_head_dim", None)
         global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
 
@@ -415,7 +429,7 @@ def get_config(
         if not hasattr(text_config, "swa_v_head_dim"):
             text_config.swa_v_head_dim = text_config.swa_head_dim
 
-    if config.model_type == "longcat_flash":
+    if model_type == "longcat_flash":
         config.update({"architectures": ["LongcatFlashForCausalLM"]})
 
     if model_override_args:

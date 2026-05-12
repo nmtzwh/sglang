@@ -236,9 +236,9 @@ SGLANG_USE_CPU_ENGINE=1 python -m sglang.launch_server \
 ```
 
 `NEXTN` and `EAGLE` are promoted to the Frozen-KV MTP path when the draft model
-uses the `Gemma4AssistantForCausalLM` architecture. Multimodal Gemma4 models,
-Gemma4 MoE, overlap/spec-v2 scheduling, top-k greater than 1, and CPU graph mode
-are not supported for this CPU MTP path yet.
+uses the `Gemma4AssistantForCausalLM` architecture or `gemma4_assistant` model
+type. Multimodal Gemma4 models, Gemma4 MoE, overlap/spec-v2 scheduling, top-k
+greater than 1, and CPU graph mode are not supported for this CPU MTP path yet.
 
 The manual AMX validation harness is available at
 `test/manual/models/test_gemma4_mtp_cpu.py`:
@@ -248,6 +248,10 @@ SGLANG_GEMMA4_CPU_TARGET=<GEMMA4_TEXT_TARGET_MODEL_OR_PATH> \
 SGLANG_GEMMA4_CPU_ASSISTANT=<GEMMA4_ASSISTANT_MODEL_OR_PATH> \
 PYTHONPATH=python python3 -m unittest test.manual.models.test_gemma4_mtp_cpu
 ```
+
+The harness checks that `NEXTN` resolves to `FROZEN_KV_MTP`, greedy outputs
+match a non-speculative CPU baseline, sampled requests run, and speculative
+acceptance is nonzero.
 
 ## Benchmarking with Requests
 

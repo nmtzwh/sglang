@@ -113,17 +113,13 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
-        # Check if the model is a GPT-OSS model
-        self.is_gpt_oss = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
-        self.is_gemma4 = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
-        )
+        model_type = None
+        if hasattr(self.tokenizer_manager.model_config, "hf_config") and hasattr(
+            self.tokenizer_manager.model_config.hf_config, "model_type"
+        ):
+            model_type = self.tokenizer_manager.model_config.hf_config.model_type
+        self.is_gpt_oss = model_type == "gpt_oss"
+        self.is_gemma4 = model_type in ("gemma4", "gemma4_text")
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
