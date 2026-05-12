@@ -68,7 +68,10 @@ from sglang.srt.speculative.spec_utils import (
     top_p_renorm_prob_cpu,
     tree_speculative_sampling_target_only_cpu,
 )
-from sglang.srt.speculative.spec_info import maybe_force_cpu_eagle_greedy_sampling
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    maybe_force_cpu_eagle_greedy_sampling,
+)
 from sglang.srt.utils import next_power_of_2
 
 
@@ -206,6 +209,14 @@ def test_cpu_eagle_sampling_default_does_not_force_frozen_kv_mtp_greedy():
         "cpu", "EAGLE", {"temperature": 0.7}
     ) == {"temperature": 0.7}
     assert maybe_force_cpu_eagle_greedy_sampling("cuda", "EAGLE", {}) == {}
+
+
+def test_frozen_kv_mtp_keeps_eagle_scheduler_contract_without_spec_v2():
+    algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
+
+    assert algorithm.is_eagle()
+    assert algorithm.is_frozen_kv_mtp()
+    assert not algorithm.supports_spec_v2()
 
 
 def test_assign_draft_cache_locs_cpu_topk1_page_size_gt_1():
