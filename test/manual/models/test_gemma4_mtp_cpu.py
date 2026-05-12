@@ -31,15 +31,6 @@ from typing import Dict, List, Optional
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    find_available_port,
-    popen_launch_server,
-)
-
 
 TARGET_ENV = "SGLANG_GEMMA4_CPU_TARGET"
 ASSISTANT_ENV = "SGLANG_GEMMA4_CPU_ASSISTANT"
@@ -111,7 +102,7 @@ def _completion(base_url: str, prompt: str, temperature: float) -> str:
     raise AssertionError(f"unexpected /generate payload: {payload!r}")
 
 
-class TestGemma4MTPCPU(CustomTestCase):
+class TestGemma4MTPCPU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -121,12 +112,20 @@ class TestGemma4MTPCPU(CustomTestCase):
         _ensure_checkpoint(cls.target_path, "target")
         _ensure_checkpoint(cls.assistant_path, "assistant")
 
+        from sglang.test.test_utils import (
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            DEFAULT_URL_FOR_TEST,
+            find_available_port,
+        )
+
         default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
         cls.base_url = f"http://127.0.0.1:{find_available_port(default_port)}"
         cls.timeout = int(os.getenv(TIMEOUT_ENV, str(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)))
 
     @staticmethod
     def _stop_process(process) -> None:
+        from sglang.srt.utils import kill_process_tree
+
         try:
             kill_process_tree(process.pid)
         except Exception:
@@ -164,6 +163,8 @@ class TestGemma4MTPCPU(CustomTestCase):
         ] + cls._common_args()
 
     def _launch(self, other_args: List[str]):
+        from sglang.test.test_utils import popen_launch_server
+
         return popen_launch_server(
             self.target_path,
             self.base_url,
