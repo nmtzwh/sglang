@@ -177,8 +177,7 @@ def test_gemma4_assistant_draft_promotes_nextn_and_eagle(monkeypatch):
         server_args._resolve_speculative_algorithm_alias("EAGLE3", "draft")
 
 
-def test_cpu_frozen_kv_mtp_validation_normalizes_topk_and_draft_tokens(monkeypatch):
-    server_args = _load_server_args(monkeypatch)
+def _cpu_frozen_kv_args(server_args):
     args = server_args.ServerArgs.__new__(server_args.ServerArgs)
     args.speculative_draft_model_path = None
     args.speculative_draft_model_revision = None
@@ -201,6 +200,12 @@ def test_cpu_frozen_kv_mtp_validation_normalizes_topk_and_draft_tokens(monkeypat
             enable_moe_block=False,
         )
     )
+    return args
+
+
+def test_cpu_frozen_kv_mtp_validation_normalizes_topk_and_draft_tokens(monkeypatch):
+    server_args = _load_server_args(monkeypatch)
+    args = _cpu_frozen_kv_args(server_args)
 
     server_args.ServerArgs._handle_speculative_decoding(args)
 
@@ -209,3 +214,45 @@ def test_cpu_frozen_kv_mtp_validation_normalizes_topk_and_draft_tokens(monkeypat
     assert args.disable_overlap_schedule is True
     assert args.enable_mixed_chunk is False
     assert args.max_running_requests == 48
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("attention_backend", "torch_native", "attention-backend intel_amx"),
+        ("speculative_eagle_topk", 2, "speculative-eagle-topk 1"),
+        ("speculative_num_steps", None, "speculative-num-steps"),
+    ],
+)
+def test_cpu_frozen_kv_mtp_validation_rejects_unsupported_options(
+    monkeypatch, field, value, match
+):
+    server_args = _load_server_args(monkeypatch)
+    args = _cpu_frozen_kv_args(server_args)
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=match):
+        server_args.ServerArgs._handle_speculative_decoding(args)
+
+
+@pytest.mark.parametrize(
+    ("arch", "enable_moe_block", "match"),
+    [
+        ("Gemma4ForConditionalGeneration", False, "text-only Gemma4ForCausalLM"),
+        ("Gemma4ForCausalLM", True, "dense Gemma4 only"),
+    ],
+)
+def test_cpu_frozen_kv_mtp_validation_rejects_multimodal_and_moe(
+    monkeypatch, arch, enable_moe_block, match
+):
+    server_args = _load_server_args(monkeypatch)
+    args = _cpu_frozen_kv_args(server_args)
+    args.get_model_config = lambda: SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=[arch],
+            enable_moe_block=enable_moe_block,
+        )
+    )
+
+    with pytest.raises(ValueError, match=match):
+        server_args.ServerArgs._handle_speculative_decoding(args)
