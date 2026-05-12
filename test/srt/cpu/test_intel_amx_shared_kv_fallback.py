@@ -13,7 +13,7 @@ def _load_backend():
     try:
         from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
         from sglang.srt.layers.radix_attention import AttentionType
-    except ModuleNotFoundError:
+    except (ImportError, ModuleNotFoundError):
         _install_sglang_stubs()
         module_path = (
             Path(__file__).resolve().parents[3]
@@ -44,7 +44,7 @@ def _install_sglang_stubs():
         "sglang.srt.model_executor.forward_batch_info",
     ]
     for name in module_names:
-        sys.modules.setdefault(name, types.ModuleType(name))
+        sys.modules[name] = types.ModuleType(name)
 
     class AttentionBackend:
         pass

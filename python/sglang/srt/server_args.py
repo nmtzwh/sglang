@@ -2667,9 +2667,10 @@ class ServerArgs:
         )
 
         if self.speculative_skip_dp_mlp_sync:
-            assert self.speculative_algorithm == "EAGLE", (
+            assert self.speculative_algorithm in ("EAGLE", "FROZEN_KV_MTP"), (
                 "--speculative-skip-dp-mlp-sync is only supported with "
-                f"speculative_algorithm == EAGLE, got {self.speculative_algorithm}."
+                "EAGLE or FROZEN_KV_MTP, got "
+                f"{self.speculative_algorithm}."
             )
 
         if self.speculative_algorithm == "FROZEN_KV_MTP":
@@ -4499,7 +4500,7 @@ class ServerArgs:
             "--speculative-skip-dp-mlp-sync",
             action="store_true",
             default=ServerArgs.speculative_skip_dp_mlp_sync,
-            help="Skip DP MLP synchronization in EAGLE speculative decoding.",
+            help="Skip DP MLP synchronization in EAGLE/Frozen-KV MTP speculative decoding.",
         )
 
         # Speculative decoding (ngram)
