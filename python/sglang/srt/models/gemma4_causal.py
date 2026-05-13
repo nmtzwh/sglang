@@ -906,7 +906,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
-        num_experts = self.config.num_experts
+        num_experts = getattr(self.config, "num_experts", 0)
 
         k_eq_v_layers = self._get_k_eq_v_layers()
 
