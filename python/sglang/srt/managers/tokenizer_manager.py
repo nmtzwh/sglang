@@ -98,7 +98,10 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
-from sglang.srt.speculative.spec_info import maybe_force_cpu_eagle_greedy_sampling
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    maybe_force_cpu_eagle_greedy_sampling,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
