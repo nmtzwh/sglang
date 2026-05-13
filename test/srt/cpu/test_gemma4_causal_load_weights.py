@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 from torch import nn
 
 
@@ -131,3 +132,118 @@ def test_dense_gemma4_load_weights_does_not_require_num_experts(monkeypatch):
     loaded = gemma4_causal.Gemma4ForCausalLM.load_weights(model, [])
 
     assert loaded == set()
+
+
+def test_gemma4_causal_load_weights_remaps_conditional_text_prefixes(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+    loaded_names = []
+
+    param = nn.Parameter(torch.zeros(2, 3))
+    param.weight_loader = lambda param, weight: loaded_names.append(weight.clone())
+    model = SimpleNamespace(
+        config=SimpleNamespace(layer_types=[]),
+        _get_k_eq_v_layers=lambda: set(),
+        named_parameters=lambda: iter([("model.embed_tokens.weight", param)]),
+        named_buffers=lambda: iter(()),
+        named_modules=lambda: iter(()),
+    )
+    loaded_weight = torch.ones(2, 3)
+
+    loaded = gemma4_causal.Gemma4ForCausalLM.load_weights(
+        model,
+        [
+            ("language_model.embed_tokens.weight", loaded_weight),
+            ("model.vision_tower.patch_embedder.weight", torch.ones(2, 3)),
+        ],
+    )
+
+    assert loaded == {"model.embed_tokens.weight"}
+    assert len(loaded_names) == 1
+    torch.testing.assert_close(loaded_names[0], loaded_weight)
+
+
+def test_gemma4_causal_load_weights_remaps_nested_conditional_text_prefix(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+    loaded_names = []
+
+    param = nn.Parameter(torch.zeros(2, 3))
+    param.weight_loader = lambda param, weight: loaded_names.append(weight.clone())
+    model = SimpleNamespace(
+        config=SimpleNamespace(layer_types=[]),
+        _get_k_eq_v_layers=lambda: set(),
+        named_parameters=lambda: iter([("model.embed_tokens.weight", param)]),
+        named_buffers=lambda: iter(()),
+        named_modules=lambda: iter(()),
+    )
+    loaded_weight = torch.ones(2, 3)
+
+    loaded = gemma4_causal.Gemma4ForCausalLM.load_weights(
+        model, [("model.language_model.model.embed_tokens.weight", loaded_weight)]
+    )
+
+    assert loaded == {"model.embed_tokens.weight"}
+    assert len(loaded_names) == 1
+    torch.testing.assert_close(loaded_names[0], loaded_weight)
+
+
+def test_gemma4_causal_load_weights_slices_attention_norm_to_head_dim(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+    loaded_values = []
+
+    param = nn.Parameter(torch.zeros(256))
+    param.weight_loader = lambda param, weight: loaded_values.append(weight.clone())
+    model = SimpleNamespace(
+        config=SimpleNamespace(layer_types=[]),
+        _get_k_eq_v_layers=lambda: set(),
+        named_parameters=lambda: iter([("model.layers.0.self_attn.q_norm.weight", param)]),
+        named_buffers=lambda: iter(()),
+        named_modules=lambda: iter(()),
+    )
+    loaded_weight = torch.arange(512, dtype=torch.float32)
+
+    loaded = gemma4_causal.Gemma4ForCausalLM.load_weights(
+        model, [("language_model.model.layers.0.self_attn.q_norm.weight", loaded_weight)]
+    )
+
+    assert loaded == {"model.layers.0.self_attn.q_norm.weight"}
+    torch.testing.assert_close(loaded_values[0], loaded_weight[:256])
+
+
+def test_gemma4_causal_load_weights_skips_nonlearned_v_norm(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+
+    param = torch.zeros(256)
+    model = SimpleNamespace(
+        config=SimpleNamespace(layer_types=[]),
+        _get_k_eq_v_layers=lambda: set(),
+        named_parameters=lambda: iter(()),
+        named_buffers=lambda: iter([("model.layers.0.self_attn.v_norm.weight", param)]),
+        named_modules=lambda: iter(()),
+    )
+
+    loaded = gemma4_causal.Gemma4ForCausalLM.load_weights(
+        model, [("language_model.model.layers.0.self_attn.v_norm.weight", torch.ones(512))]
+    )
+
+    assert loaded == set()
+
+
+def test_gemma4_causal_load_weights_reports_mismatched_name(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+
+    param = nn.Parameter(torch.zeros(2, 3))
+    param.weight_loader = lambda param, weight: (_ for _ in ()).throw(
+        AssertionError(f"{param.shape} != {weight.shape}")
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(layer_types=[]),
+        _get_k_eq_v_layers=lambda: set(),
+        named_parameters=lambda: iter([("model.embed_tokens.weight", param)]),
+        named_buffers=lambda: iter(()),
+        named_modules=lambda: iter(()),
+    )
+
+    with pytest.raises(RuntimeError, match="language_model.embed_tokens.weight"):
+        gemma4_causal.Gemma4ForCausalLM.load_weights(
+            model, [("language_model.embed_tokens.weight", torch.ones(3, 2))]
+        )

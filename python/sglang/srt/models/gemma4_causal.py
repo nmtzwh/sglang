@@ -53,6 +53,60 @@ from sglang.srt.utils import add_prefix, make_layers
 logger = logging.getLogger(__name__)
 
 
+def _remap_gemma4_text_weight_name(name: str) -> Optional[str]:
+    """Map Gemma4 conditional/text checkpoint names to Gemma4ForCausalLM names."""
+    optional_model_prefix = name[6:] if name.startswith("model.") else name
+    if optional_model_prefix.startswith(
+        ("vision_tower.", "audio_tower.", "embed_vision.", "embed_audio.")
+    ):
+        return None
+
+    prefix_mapping = (
+        ("model.language_model.model.", "model."),
+        ("language_model.model.", "model."),
+        ("model.language_model.", "model."),
+        ("language_model.", "model."),
+    )
+    for source_prefix, target_prefix in prefix_mapping:
+        if name.startswith(source_prefix):
+            return target_prefix + name[len(source_prefix) :]
+    return name
+
+
+def _maybe_adjust_gemma4_text_weight(
+    name: str, param: torch.Tensor, loaded_weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    if name.endswith(".self_attn.v_norm.weight"):
+        return None
+    if (
+        name.endswith((".self_attn.q_norm.weight", ".self_attn.k_norm.weight"))
+        and loaded_weight.dim() == 1
+        and param.dim() == 1
+        and loaded_weight.numel() > param.numel()
+    ):
+        return loaded_weight[: param.numel()]
+    return loaded_weight
+
+
+def _load_gemma4_text_weight(
+    weight_loader,
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    original_name: str,
+    resolved_name: str,
+    *args,
+) -> None:
+    try:
+        weight_loader(param, loaded_weight, *args)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load Gemma4 weight "
+            f"{original_name!r} as {resolved_name!r}: "
+            f"loaded shape={tuple(loaded_weight.shape)}, "
+            f"param shape={tuple(param.shape)}"
+        ) from exc
+
+
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
@@ -919,8 +973,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 non_persistent_buffers.add(full)
 
         loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
-            name = name.replace("model.language_model.", "model.")
+        for original_name, loaded_weight in weights:
+            name = _remap_gemma4_text_weight_name(original_name)
+            if name is None:
+                continue
 
             # HF has router.per_expert_scale and experts.* on the decoder layer;
             # remap into our moe.* subtree since Gemma4MoE owns both.
@@ -954,7 +1010,16 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 for i in range(num_experts):
                     chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
                     for chunk, sid in zip(chunks, shard_ids):
-                        weight_loader(param, chunk, name, sid, i)
+                        _load_gemma4_text_weight(
+                            weight_loader,
+                            param,
+                            chunk,
+                            original_name,
+                            name,
+                            name,
+                            sid,
+                            i,
+                        )
                 break
             else:
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -966,9 +1031,23 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
+                    _load_gemma4_text_weight(
+                        weight_loader,
+                        param,
+                        loaded_weight,
+                        original_name,
+                        name,
+                        shard_id,
+                    )
                     if should_dup_k_to_v:
-                        weight_loader(param, loaded_weight, "v")
+                        _load_gemma4_text_weight(
+                            weight_loader,
+                            param,
+                            loaded_weight,
+                            original_name,
+                            name,
+                            "v",
+                        )
                     break
                 else:
                     name = orig_name
@@ -980,10 +1059,17 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
+                    loaded_weight = _maybe_adjust_gemma4_text_weight(
+                        name, param, loaded_weight
+                    )
+                    if loaded_weight is None:
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, loaded_weight)
+                    _load_gemma4_text_weight(
+                        weight_loader, param, loaded_weight, original_name, name
+                    )
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
