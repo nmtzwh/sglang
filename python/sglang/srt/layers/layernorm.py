@@ -281,9 +281,16 @@ class RMSNorm(MultiPlatformOp):
                 x, residual, self.weight.data, self.variance_epsilon
             )
             return x, residual
-        return torch.ops.sgl_kernel.rmsnorm_cpu(
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(
             x, self.weight.data, self.variance_epsilon
         )
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
 
     def forward_xpu(
         self,
@@ -501,9 +508,16 @@ class GemmaRMSNorm(MultiPlatformOp):
                 x, residual, self.weight.data, self.variance_epsilon
             )
             return x, residual
-        return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
             x, self.weight.data, self.variance_epsilon
         )
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
 
     def forward_npu(
         self,
@@ -550,7 +564,14 @@ class Gemma3RMSNorm(MultiPlatformOp):
 
     def forward_cpu(self, x):
         if _is_cpu_amx_available and x.stride(-1) == 1:
-            return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
+            needs_reshape = x.dim() != 2
+            if needs_reshape:
+                original_shape = x.shape
+                x = x.contiguous().reshape(-1, original_shape[-1])
+            out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         return self.forward_native(x)
 
     def forward_cuda(self, x):
