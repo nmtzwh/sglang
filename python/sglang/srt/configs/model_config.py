@@ -159,7 +159,19 @@ class ModelConfig:
             not enable_multimodal
             and self.hf_config.architectures[0] == "Gemma4ForConditionalGeneration"
         ):
-            self.hf_config.architectures[0] = "Gemma4ForCausalLM"
+            if hasattr(self.hf_text_config, "update"):
+                self.hf_text_config.update({"architectures": ["Gemma4ForCausalLM"]})
+            else:
+                setattr(self.hf_text_config, "architectures", ["Gemma4ForCausalLM"])
+            if not hasattr(self.hf_text_config, "_name_or_path") and hasattr(
+                self.hf_config, "_name_or_path"
+            ):
+                setattr(
+                    self.hf_text_config,
+                    "_name_or_path",
+                    getattr(self.hf_config, "_name_or_path"),
+                )
+            self.hf_config = self.hf_text_config
 
         # Config draft model
         self._config_draft_model()

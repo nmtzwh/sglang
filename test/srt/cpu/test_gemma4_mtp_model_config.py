@@ -165,3 +165,57 @@ def test_gemma4_conditional_generation_preserves_multimodal_when_enabled(monkeyp
 
     assert config.is_multimodal
     assert config.hf_config.architectures == ["Gemma4ForConditionalGeneration"]
+
+
+def test_gemma4_conditional_text_only_uses_inner_text_config(monkeypatch):
+    model_config = _load_model_config(monkeypatch)
+    text_cfg = SimpleNamespace(
+        architectures=[],
+        model_type="gemma4_text",
+        num_hidden_layers=4,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+    )
+    outer_cfg = SimpleNamespace(
+        architectures=["Gemma4ForConditionalGeneration"],
+        model_type="gemma4",
+        text_config=text_cfg,
+        vision_config=SimpleNamespace(),
+        audio_config=None,
+    )
+
+    monkeypatch.setattr(model_config, "get_config", lambda *args, **kwargs: outer_cfg)
+    monkeypatch.setattr(
+        model_config, "get_hf_text_config", lambda config: config.text_config
+    )
+    monkeypatch.setattr(
+        model_config, "get_generation_config", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(model_config, "_get_and_verify_dtype", lambda *args: "float32")
+    for name in [
+        "_validate_quantize_and_serve_config",
+        "_maybe_pull_model_tokenizer_from_remote",
+        "_config_draft_model",
+        "_derive_context_length",
+        "_derive_model_shapes",
+        "_verify_quantization",
+        "_verify_transformers_version",
+        "_verify_dual_chunk_attention_config",
+    ]:
+        monkeypatch.setattr(model_config.ModelConfig, name, lambda self, *args: None)
+    monkeypatch.setattr(
+        model_config.ModelConfig, "_get_hf_eos_token_id", lambda self: None
+    )
+
+    config = model_config.ModelConfig("gemma4")
+
+    assert config.hf_config is text_cfg
+    assert config.hf_text_config is text_cfg
+    assert config.hf_config.architectures == ["Gemma4ForCausalLM"]
+    assert config.is_hybrid_swa
+    assert config.swa_attention_layer_ids == [0, 2]
+    assert config.full_attention_layer_ids == [1, 3]
