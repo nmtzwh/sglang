@@ -283,15 +283,29 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from transformers import AutoConfig
+        try:
+            from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
-        )
-        architectures = getattr(cfg, "architectures", None) or []
+            cfg = AutoConfig.from_pretrained(
+                speculative_draft_model_path, trust_remote_code=trust_remote_code
+            )
+            architectures = getattr(cfg, "architectures", None) or []
+            model_type = getattr(cfg, "model_type", None)
+        except (KeyError, ValueError):
+            import json
+            import os
+
+            with open(
+                os.path.join(speculative_draft_model_path, "config.json"),
+                encoding="utf-8",
+            ) as f:
+                cfg = json.load(f)
+            architectures = cfg.get("architectures") or []
+            model_type = cfg.get("model_type")
+
         is_gemma4_draft = (
             "Gemma4AssistantForCausalLM" in architectures
-            or getattr(cfg, "model_type", None) == "gemma4_assistant"
+            or model_type == "gemma4_assistant"
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
@@ -2691,9 +2705,10 @@ class ServerArgs:
                         "CPU Frozen-KV MTP currently supports dense Gemma4 only; "
                         "Gemma4 MoE is not supported."
                     )
-                if self.attention_backend != "intel_amx":
+                if self.attention_backend not in ("intel_amx", "torch_native"):
                     raise ValueError(
-                        "CPU Frozen-KV MTP requires --attention-backend intel_amx."
+                        "CPU Frozen-KV MTP requires --attention-backend intel_amx "
+                        "or torch_native."
                     )
                 if self.speculative_eagle_topk is None:
                     self.speculative_eagle_topk = 1

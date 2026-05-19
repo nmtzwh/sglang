@@ -626,6 +626,46 @@ class Gemma4DecoderLayer(nn.Module):
                 self.layer_scalar,
                 norm.variance_epsilon,
             )
+        elif hidden_states.device.type == "cpu" and hidden_states.dim() == 2:
+            norm = self.post_feedforward_layernorm
+            layer_scalar = (
+                float(self.layer_scalar.item())
+                if self.layer_scalar.numel() == 1
+                else 1.0
+            )
+            fused_norm_residual = getattr(
+                torch.ops.sgl_kernel, "gemma4_rmsnorm_residual_cpu", None
+            )
+            used_fused_norm_residual = False
+            if (
+                fused_norm_residual is not None
+                and hasattr(norm, "weight")
+                and (not self.has_ple or layer_scalar == 1.0)
+            ):
+                hidden_states = fused_norm_residual(
+                    hidden_states,
+                    norm.weight.data,
+                    residual,
+                    layer_scalar if not self.has_ple else 1.0,
+                    norm.variance_epsilon,
+                )
+                used_fused_norm_residual = True
+            else:
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+                hidden_states = hidden_states + residual
+
+            if self.has_ple and per_layer_input is not None:
+                gate, _ = self.per_layer_input_gate(hidden_states)
+                gate = torch.nn.functional.gelu(gate, approximate="tanh")
+                gated_per_layer = gate * per_layer_input
+                per_layer_contribution, _ = self.per_layer_projection(gated_per_layer)
+                per_layer_contribution = self.post_per_layer_input_norm(
+                    per_layer_contribution
+                )
+                hidden_states = hidden_states + per_layer_contribution
+
+            if (not used_fused_norm_residual or self.has_ple) and layer_scalar != 1.0:
+                hidden_states = hidden_states * layer_scalar
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = hidden_states + residual
@@ -640,7 +680,14 @@ class Gemma4DecoderLayer(nn.Module):
                 )
                 hidden_states = hidden_states + per_layer_contribution
 
-            hidden_states = hidden_states * self.layer_scalar
+            if hidden_states.device.type == "cpu" and self.layer_scalar.numel() == 1:
+                layer_scalar = float(self.layer_scalar.item())
+                if layer_scalar != 1.0:
+                    hidden_states = hidden_states * layer_scalar
+            else:
+                hidden_states = hidden_states * self.layer_scalar.to(
+                    dtype=hidden_states.dtype, device=hidden_states.device
+                )
         return hidden_states, None
 
 
@@ -693,10 +740,8 @@ class Gemma4TextModel(PreTrainedModel):
                 self.hidden_size_per_layer_input,
                 config.rms_norm_eps,
             )
-            self.per_layer_input_scale = torch.rsqrt(torch.tensor(2.0))
-            self.per_layer_projection_scale = torch.tensor(
-                config.hidden_size**-0.5,
-            )
+            self.per_layer_input_scale = 2.0**-0.5
+            self.per_layer_projection_scale = config.hidden_size**-0.5
         else:
             self.embed_tokens_per_layer = None
             self.per_layer_model_projection = None

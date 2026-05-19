@@ -284,6 +284,25 @@ def _ensure_llama_flash_attention2_compat() -> None:
             modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
 
 
+def _load_gemma4_assistant_config(model: str) -> PretrainedConfig:
+    import json
+
+    from transformers import Gemma4TextConfig
+
+    config_path = Path(model) / "config.json"
+    with open(config_path, encoding="utf-8") as f:
+        config_dict = json.load(f)
+
+    text_config_dict = config_dict.pop("text_config", None) or {}
+    config = PretrainedConfig(**config_dict)
+    config.model_type = "gemma4_assistant"
+    config.architectures = config_dict.get(
+        "architectures", ["Gemma4AssistantForCausalLM"]
+    )
+    config.text_config = Gemma4TextConfig(**text_config_dict)
+    return config
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -316,11 +335,17 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if not "deepseek_v32" in str(e):
+            if "gemma4_assistant" in str(e):
+                config = _load_gemma4_assistant_config(model)
+            elif "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
 
     if config.architectures and config.architectures[0] == "Phi4MMForCausalLM":
         # Phi4MMForCausalLM uses a hard-coded vision_config. See:

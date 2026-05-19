@@ -247,3 +247,83 @@ def test_gemma4_causal_load_weights_reports_mismatched_name(monkeypatch):
         gemma4_causal.Gemma4ForCausalLM.load_weights(
             model, [("language_model.embed_tokens.weight", torch.ones(3, 2))]
         )
+
+
+def test_gemma4_decoder_layer_scalar_preserves_bfloat16_on_cpu(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+
+    class _Identity(nn.Module):
+        def forward(self, x):
+            return x
+
+    class _ResidualNorm(nn.Module):
+        def forward(self, x, residual):
+            return x, residual
+
+    class _Attention(nn.Module):
+        def forward(self, positions, hidden_states, forward_batch):
+            return hidden_states
+
+    layer = SimpleNamespace(
+        input_layernorm=_Identity(),
+        self_attn=_Attention(),
+        post_attention_layernorm=_Identity(),
+        enable_moe_block=False,
+        pre_feedforward_layernorm=_ResidualNorm(),
+        mlp=_Identity(),
+        has_ple=False,
+        post_feedforward_layernorm=_Identity(),
+        layer_scalar=torch.ones(1, dtype=torch.float32),
+    )
+    hidden_states = torch.ones(2, 4, dtype=torch.bfloat16)
+
+    output, _ = gemma4_causal.Gemma4DecoderLayer.forward(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden_states,
+        per_layer_input=None,
+        forward_batch=None,
+    )
+
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, torch.full_like(output, 2.0))
+
+
+def test_gemma4_decoder_layer_scalar_applies_non_identity_on_cpu(monkeypatch):
+    gemma4_causal = _load_gemma4_causal(monkeypatch)
+
+    class _Identity(nn.Module):
+        def forward(self, x):
+            return x
+
+    class _ResidualNorm(nn.Module):
+        def forward(self, x, residual):
+            return x, residual
+
+    class _Attention(nn.Module):
+        def forward(self, positions, hidden_states, forward_batch):
+            return hidden_states
+
+    layer = SimpleNamespace(
+        input_layernorm=_Identity(),
+        self_attn=_Attention(),
+        post_attention_layernorm=_Identity(),
+        enable_moe_block=False,
+        pre_feedforward_layernorm=_ResidualNorm(),
+        mlp=_Identity(),
+        has_ple=False,
+        post_feedforward_layernorm=_Identity(),
+        layer_scalar=torch.tensor([0.5], dtype=torch.float32),
+    )
+    hidden_states = torch.ones(2, 4, dtype=torch.bfloat16)
+
+    output, _ = gemma4_causal.Gemma4DecoderLayer.forward(
+        layer,
+        positions=torch.arange(2),
+        hidden_states=hidden_states,
+        per_layer_input=None,
+        forward_batch=None,
+    )
+
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, torch.full_like(output, 1.0))

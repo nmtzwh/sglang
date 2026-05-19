@@ -67,6 +67,7 @@ class _KVPool:
         self.value_buffer = value_buffer
         self.full_to_swa = full_to_swa
         self.layers_mapping = {0: (0, True)} if full_to_swa is not None else None
+        self.translate_shapes = []
 
     def get_key_buffer(self, layer_id):
         assert layer_id == 0
@@ -77,6 +78,7 @@ class _KVPool:
         return self.value_buffer
 
     def translate_loc_from_full_to_swa(self, kv_indices):
+        self.translate_shapes.append(kv_indices.shape)
         return self.full_to_swa[kv_indices.to(torch.long)].to(torch.int32)
 
 
@@ -109,6 +111,7 @@ def _layer(
         qk_head_dim=q_head_dim,
         v_head_dim=v_head_dim,
         scaling=0.5,
+        logit_cap=0.0,
         is_cross_attention=False,
         attn_type=attention_type.DECODER,
         sliding_window_size=sliding_window_size,
@@ -255,6 +258,59 @@ def test_shared_kv_fallback_translates_swa_req_to_token_indices():
     torch.testing.assert_close(o, expected)
 
 
+def test_full_attention_shared_kv_decode_uses_cached_kv_kernel_path():
+    IntelAMXAttnBackend, AttentionType = _load_backend()
+    layer = _layer(AttentionType, sliding_window_size=-1)
+    key_buffer = torch.randn(8, layer.tp_k_head_num, layer.qk_head_dim)
+    value_buffer = torch.randn(8, layer.tp_k_head_num, layer.v_head_dim)
+    req_to_token = torch.tensor([[0, 2, 4]], dtype=torch.int64)
+    req_pool_indices = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([3], dtype=torch.int64)
+    q = torch.randn(1, layer.tp_q_head_num, layer.qk_head_dim)
+    forward_batch = _batch(key_buffer, value_buffer, req_to_token, req_pool_indices)
+    forward_batch.out_cache_loc = torch.tensor([4], dtype=torch.int64)
+    forward_batch.seq_lens = seq_lens
+    captured = {}
+
+    def fake_decode_attention(
+        query,
+        k_cache,
+        v_cache,
+        output,
+        key,
+        value,
+        loc,
+        *args,
+    ):
+        captured["key"] = key.clone()
+        captured["value"] = value.clone()
+        captured["loc"] = loc.clone()
+        output.zero_()
+
+    backend = IntelAMXAttnBackend.__new__(IntelAMXAttnBackend)
+    backend.forward_metadata = (
+        torch.zeros((1, layer.tp_q_head_num, 8, layer.v_head_dim + 1)),
+        None,
+    )
+    backend.decode_attention_fwd = fake_decode_attention
+
+    out = backend.forward_decode(
+        q.reshape(1, -1),
+        None,
+        None,
+        layer,
+        forward_batch,
+        save_kv_cache=False,
+    )
+
+    assert out.shape == (1, layer.tp_q_head_num * layer.v_head_dim)
+    torch.testing.assert_close(captured["key"], key_buffer[forward_batch.out_cache_loc])
+    torch.testing.assert_close(
+        captured["value"], value_buffer[forward_batch.out_cache_loc]
+    )
+    torch.testing.assert_close(captured["loc"], forward_batch.out_cache_loc)
+
+
 def test_swa_cache_loc_translation_uses_pool_mapping():
     IntelAMXAttnBackend, AttentionType = _load_backend()
     layer = _layer(AttentionType)
@@ -323,6 +379,158 @@ def test_sliding_window_decode_fallback_masks_old_tokens():
     torch.testing.assert_close(o, expected)
 
 
+def test_sliding_window_decode_fallback_slices_kv_and_uses_sdpa_gqa(monkeypatch):
+    IntelAMXAttnBackend, AttentionType = _load_backend()
+    backend_functionals = IntelAMXAttnBackend._forward_cached_kv_torch.__globals__["F"]
+    layer = _layer(
+        AttentionType,
+        num_q_heads=8,
+        num_kv_heads=1,
+        sliding_window_size=3,
+    )
+    key_buffer = torch.randn(16, layer.tp_k_head_num, layer.qk_head_dim)
+    value_buffer = torch.randn(16, layer.tp_k_head_num, layer.v_head_dim)
+    req_to_token = torch.arange(16, dtype=torch.int64).unsqueeze(0)
+    req_pool_indices = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([10], dtype=torch.int64)
+    q = torch.randn(1, layer.tp_q_head_num, layer.qk_head_dim)
+    o = torch.empty(1, layer.tp_q_head_num, layer.v_head_dim)
+    captured = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        captured["key_shape"] = key.shape
+        captured["attn_mask"] = kwargs["attn_mask"]
+        captured["enable_gqa"] = kwargs["enable_gqa"]
+        return query.new_zeros(
+            (query.shape[0], query.shape[1], query.shape[2], value.shape[-1])
+        )
+
+    monkeypatch.setattr(backend_functionals, "scaled_dot_product_attention", fake_sdpa)
+
+    backend = IntelAMXAttnBackend.__new__(IntelAMXAttnBackend)
+    backend._forward_cached_kv_torch(
+        q.reshape(1, -1),
+        o.reshape(1, -1),
+        layer,
+        _batch(key_buffer, value_buffer, req_to_token, req_pool_indices),
+        seq_lens,
+    )
+
+    assert captured["key_shape"] == torch.Size([1, 1, 4, layer.qk_head_dim])
+    assert captured["attn_mask"] is None
+    assert captured["enable_gqa"] is True
+
+
+def test_sliding_window_decode_translates_only_visible_swa_window(monkeypatch):
+    IntelAMXAttnBackend, AttentionType = _load_backend()
+    backend_functionals = IntelAMXAttnBackend._forward_cached_kv_torch.__globals__["F"]
+    layer = _layer(
+        AttentionType,
+        num_q_heads=8,
+        num_kv_heads=1,
+        sliding_window_size=3,
+    )
+    key_buffer = torch.randn(16, layer.tp_k_head_num, layer.qk_head_dim)
+    value_buffer = torch.randn(16, layer.tp_k_head_num, layer.v_head_dim)
+    req_to_token = torch.arange(16, dtype=torch.int64).unsqueeze(0)
+    full_to_swa = torch.arange(17, dtype=torch.int64)
+    full_to_swa[:16] = (full_to_swa[:16] * 3 + 1) % 16
+    full_to_swa[-1] = -1
+    req_pool_indices = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([10], dtype=torch.int64)
+    q = torch.randn(1, layer.tp_q_head_num, layer.qk_head_dim)
+    o = torch.empty(1, layer.tp_q_head_num, layer.v_head_dim)
+
+    def fake_sdpa(query, key, value, **kwargs):
+        return query.new_zeros(
+            (query.shape[0], query.shape[1], query.shape[2], value.shape[-1])
+        )
+
+    monkeypatch.setattr(backend_functionals, "scaled_dot_product_attention", fake_sdpa)
+
+    forward_batch = _batch(
+        key_buffer,
+        value_buffer,
+        req_to_token,
+        req_pool_indices,
+        full_to_swa=full_to_swa,
+    )
+    backend = IntelAMXAttnBackend.__new__(IntelAMXAttnBackend)
+    backend._forward_cached_kv_torch(
+        q.reshape(1, -1),
+        o.reshape(1, -1),
+        layer,
+        forward_batch,
+        seq_lens,
+    )
+
+    assert forward_batch.token_to_kv_pool.translate_shapes == [torch.Size([4])]
+
+
+def test_sliding_window_decode_swa_vector_path_matches_reference():
+    IntelAMXAttnBackend, AttentionType = _load_backend()
+    torch.manual_seed(5)
+    layer = _layer(
+        AttentionType,
+        num_q_heads=8,
+        num_kv_heads=1,
+        sliding_window_size=3,
+    )
+    key_buffer = torch.randn(20, layer.tp_k_head_num, layer.qk_head_dim)
+    value_buffer = torch.randn(20, layer.tp_k_head_num, layer.v_head_dim)
+    req_to_token = torch.tensor(
+        [
+            [1, 3, 5, 7, 9, 11, 0, 0],
+            [2, 4, 6, 8, 10, 12, 14, 16],
+        ],
+        dtype=torch.int64,
+    )
+    full_to_swa = torch.arange(21, dtype=torch.int64)
+    full_to_swa[:20] = (full_to_swa[:20] * 7 + 2) % 20
+    full_to_swa[-1] = -1
+    req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+    seq_lens = torch.tensor([6, 8], dtype=torch.int64)
+    q = torch.randn(2, layer.tp_q_head_num, layer.qk_head_dim)
+    o = torch.empty(2, layer.tp_q_head_num, layer.v_head_dim)
+
+    forward_batch = _batch(
+        key_buffer,
+        value_buffer,
+        req_to_token,
+        req_pool_indices,
+        full_to_swa=full_to_swa,
+    )
+    backend = IntelAMXAttnBackend.__new__(IntelAMXAttnBackend)
+    backend._forward_cached_kv_torch(
+        q.reshape(2, -1),
+        o.reshape(2, -1),
+        layer,
+        forward_batch,
+        seq_lens,
+    )
+
+    expected = torch.cat(
+        [
+            _sdpa_expected(
+                q[:1],
+                key_buffer,
+                value_buffer,
+                full_to_swa[req_to_token[0, 2:6]],
+                layer.scaling,
+            ),
+            _sdpa_expected(
+                q[1:2],
+                key_buffer,
+                value_buffer,
+                full_to_swa[req_to_token[1, 4:8]],
+                layer.scaling,
+            ),
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(o, expected)
+
+
 def test_sliding_window_extend_fallback_combines_causal_and_window_masks():
     IntelAMXAttnBackend, AttentionType = _load_backend()
     torch.manual_seed(4)
@@ -358,3 +566,49 @@ def test_sliding_window_extend_fallback_combines_causal_and_window_masks():
         sliding_window_size=1,
     )
     torch.testing.assert_close(o, expected)
+
+
+def test_sliding_window_extend_fallback_slices_kv_before_mask(monkeypatch):
+    IntelAMXAttnBackend, AttentionType = _load_backend()
+    backend_functionals = IntelAMXAttnBackend._forward_cached_kv_torch.__globals__["F"]
+    layer = _layer(
+        AttentionType,
+        num_q_heads=8,
+        num_kv_heads=1,
+        sliding_window_size=3,
+    )
+    key_buffer = torch.randn(16, layer.tp_k_head_num, layer.qk_head_dim)
+    value_buffer = torch.randn(16, layer.tp_k_head_num, layer.v_head_dim)
+    req_to_token = torch.arange(16, dtype=torch.int64).unsqueeze(0)
+    req_pool_indices = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([10], dtype=torch.int64)
+    extend_seq_lens = torch.tensor([2], dtype=torch.int64)
+    extend_start_loc = torch.tensor([0], dtype=torch.int64)
+    q = torch.randn(2, layer.tp_q_head_num, layer.qk_head_dim)
+    o = torch.empty(2, layer.tp_q_head_num, layer.v_head_dim)
+    captured = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        captured["key_shape"] = key.shape
+        captured["attn_mask"] = kwargs["attn_mask"]
+        captured["enable_gqa"] = kwargs["enable_gqa"]
+        return query.new_zeros(
+            (query.shape[0], query.shape[1], query.shape[2], value.shape[-1])
+        )
+
+    monkeypatch.setattr(backend_functionals, "scaled_dot_product_attention", fake_sdpa)
+
+    backend = IntelAMXAttnBackend.__new__(IntelAMXAttnBackend)
+    backend._forward_cached_kv_torch(
+        q.reshape(2, -1),
+        o.reshape(2, -1),
+        layer,
+        _batch(key_buffer, value_buffer, req_to_token, req_pool_indices),
+        seq_lens,
+        extend_seq_lens,
+        extend_start_loc,
+    )
+
+    assert captured["key_shape"] == torch.Size([1, 1, 5, layer.qk_head_dim])
+    assert captured["attn_mask"].shape == torch.Size([2, 5])
+    assert captured["enable_gqa"] is True

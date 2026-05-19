@@ -124,3 +124,44 @@ def test_gemma3_rmsnorm_cpu_flattens_higher_rank_input_for_kernel(monkeypatch):
     assert seen_shape == torch.Size([6, 4])
     assert out.shape == x.shape
     torch.testing.assert_close(out, torch.ones_like(x))
+
+
+def test_gemma4_rmsnorm_cpu_flattens_higher_rank_input_for_kernel(monkeypatch):
+    layernorm = _load_layernorm(monkeypatch)
+    seen_shape = None
+
+    def rmsnorm_cpu(x, weight, eps):
+        nonlocal seen_shape
+        seen_shape = x.shape
+        assert x.dim() == 2
+        return x + 1
+
+    monkeypatch.setattr(torch.ops.sgl_kernel, "rmsnorm_cpu", rmsnorm_cpu, raising=False)
+
+    x = torch.zeros(2, 3, 4)
+    out = layernorm.Gemma4RMSNorm(4).forward_cpu(x)
+
+    assert seen_shape == torch.Size([6, 4])
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, torch.ones_like(x))
+
+
+def test_gemma4_rmsnorm_cpu_uses_gemma_shift_kernel(monkeypatch):
+    layernorm = _load_layernorm(monkeypatch)
+    called = False
+
+    def gemma_rmsnorm_cpu(x, weight, eps):
+        nonlocal called
+        called = True
+        assert x.dim() == 2
+        return x + 2
+
+    monkeypatch.setattr(
+        torch.ops.sgl_kernel, "gemma_rmsnorm_cpu", gemma_rmsnorm_cpu, raising=False
+    )
+
+    x = torch.zeros(2, 4)
+    out = layernorm.Gemma4RMSNorm(4, scale_shift=1.0).forward_cpu(x)
+
+    assert called
+    torch.testing.assert_close(out, torch.full_like(x, 2))

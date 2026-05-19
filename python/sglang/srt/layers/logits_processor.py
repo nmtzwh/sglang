@@ -841,12 +841,7 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
-            if not _is_npu:
-                fused_softcap(logits, self.final_logit_softcapping)
-            else:
-                logits = self.final_logit_softcapping * torch.tanh(
-                    logits / self.final_logit_softcapping
-                )
+            logits = fused_softcap(logits, self.final_logit_softcapping)
 
         return logits
 
@@ -1111,6 +1106,19 @@ def fused_softcap_kernel(
 
 
 def fused_softcap(full_logits, final_logit_softcapping):
+    if _is_npu or not full_logits.is_cuda:
+        if full_logits.dtype in (torch.float32, torch.float64):
+            full_logits.div_(final_logit_softcapping)
+            full_logits.tanh_()
+            full_logits.mul_(final_logit_softcapping)
+            return full_logits
+        return full_logits.copy_(
+            (
+                final_logit_softcapping
+                * torch.tanh(full_logits.float() / final_logit_softcapping)
+            ).to(full_logits.dtype)
+        )
+
     n_elements = full_logits.numel()
     BLOCK_SIZE = 1024
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)

@@ -136,10 +136,20 @@ def select_last_extend_hidden(
 def select_last_verified_seed(
     draft_input: FrozenKVMTPDraftInput,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if draft_input.num_accepted_tokens is None:
+    num_accepted_tokens = getattr(draft_input, "num_accepted_tokens", None)
+    if num_accepted_tokens is not None:
+        counts = num_accepted_tokens.to(torch.long)
+    elif draft_input.accept_length is not None:
+        counts = draft_input.accept_length.to(torch.long) + 1
+    elif draft_input.accept_length_cpu is not None:
+        counts = torch.tensor(
+            [x + 1 for x in draft_input.accept_length_cpu],
+            device=draft_input.verified_id.device,
+            dtype=torch.long,
+        )
+    else:
         return draft_input.verified_id, draft_input.hidden_states
 
-    counts = draft_input.num_accepted_tokens.to(torch.long)
     last_indices = torch.cumsum(counts, dim=0) - 1
     return (
         draft_input.verified_id[last_indices],

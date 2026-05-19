@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -41,6 +42,12 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+@dataclass(frozen=True)
+class MemoryPoolConfig:
+    max_total_num_tokens: int
+    max_running_requests: int
 
 
 class ModelRunnerKVCacheMixin:
@@ -721,7 +728,10 @@ class ModelRunnerKVCacheMixin:
             )
             self.max_total_num_tokens = tensor.item()
 
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+        if self.memory_pool_config is not None:
+            self.max_total_num_tokens = self.memory_pool_config.max_total_num_tokens
+            max_num_reqs = self.memory_pool_config.max_running_requests
+        elif not self.spec_algorithm.is_none() and self.is_draft_worker:
             self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             max_num_reqs = self.server_args.max_num_reqs
 
@@ -733,6 +743,12 @@ class ModelRunnerKVCacheMixin:
             # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
             self.server_args.draft_runner_cache_size = self.max_total_num_tokens
             self.server_args.max_num_reqs = max_num_reqs
+
+        if self.memory_pool_config is None:
+            self.memory_pool_config = MemoryPoolConfig(
+                max_total_num_tokens=self.max_total_num_tokens,
+                max_running_requests=max_num_reqs,
+            )
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(

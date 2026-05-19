@@ -646,6 +646,31 @@ class Gemma4RMSNorm(MultiPlatformOp):
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+
+        if not x.is_contiguous() and x.stride(-1) != 1:
+            x = x.contiguous()
+
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+
+        if self.with_scale and self.scale_shift == 1.0:
+            out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+                x, self.weight.data, self.eps
+            )
+        elif self.scale_shift == 0.0:
+            out = torch.ops.sgl_kernel.rmsnorm_cpu(x, self.weight.data, self.eps)
+        else:
+            out = self.forward_native(x)
+
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
+
 
 class RMSNormWithoutScale(MultiPlatformOp):
     def __init__(self, hidden_size: int, eps=1e-6):

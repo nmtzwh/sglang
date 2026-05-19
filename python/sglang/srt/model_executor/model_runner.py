@@ -131,6 +131,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -300,6 +301,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
     ):
         # Parse args
@@ -332,6 +334,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.memory_pool_config = memory_pool_config
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA

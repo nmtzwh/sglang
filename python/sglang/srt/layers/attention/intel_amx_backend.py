@@ -137,6 +137,18 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         return token_to_kv_pool.translate_loc_from_full_to_swa(loc)
 
+    def _is_swa_layer(self, layer: RadixAttention, forward_batch: ForwardBatch) -> bool:
+        layers_mapping = getattr(forward_batch.token_to_kv_pool, "layers_mapping", None)
+        if layers_mapping is None:
+            return False
+
+        layer_mapping = layers_mapping.get(layer.layer_id)
+        if layer_mapping is None:
+            return False
+
+        _, is_swa_layer = layer_mapping
+        return is_swa_layer
+
     def _use_torch_cached_kv(self, layer: RadixAttention, k, v) -> bool:
         return (
             k is None
@@ -146,6 +158,16 @@ class IntelAMXAttnBackend(AttentionBackend):
                 and layer.sliding_window_size > -1
             )
         )
+
+    def _get_cached_current_kv(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_loc = self._get_cache_loc_for_layer(layer, forward_batch).to(torch.long)
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        return k_buffer[cache_loc], v_buffer[cache_loc]
 
     def _get_decode_attn_logits(
         self, layer: RadixAttention, forward_batch: ForwardBatch
@@ -168,6 +190,45 @@ class IntelAMXAttnBackend(AttentionBackend):
             device=attn_logits.device,
         )
 
+    def _forward_swa_decode_cached_kv_torch(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+    ):
+        window_size = layer.sliding_window_size + 1
+        req_pool_indices = forward_batch.req_pool_indices
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+
+        kv_offsets = torch.arange(window_size, device=q.device, dtype=seq_lens.dtype)
+        kv_positions = seq_lens.unsqueeze(1) - window_size + kv_offsets.unsqueeze(0)
+        kv_valid = kv_positions >= 0
+        kv_positions = kv_positions.clamp_min(0)
+
+        token_indices = req_to_token[req_pool_indices.unsqueeze(1), kv_positions]
+        token_indices = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+            token_indices.to(torch.long)
+        ).to(torch.long)
+
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        per_req_q = q.unsqueeze(2)
+        per_req_k = k_buffer[token_indices].permute(0, 2, 1, 3)
+        per_req_v = v_buffer[token_indices].permute(0, 2, 1, 3)
+
+        per_req_o = F.scaled_dot_product_attention(
+            per_req_q,
+            per_req_k,
+            per_req_v,
+            attn_mask=kv_valid[:, None, None, :],
+            dropout_p=0.0,
+            scale=layer.scaling,
+            enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+        )
+        o.copy_(per_req_o.squeeze(2))
+
     def _forward_cached_kv_torch(
         self,
         q: torch.Tensor,
@@ -182,11 +243,25 @@ class IntelAMXAttnBackend(AttentionBackend):
         o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        req_to_token = self._get_req_to_token_for_layer(layer, forward_batch)
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
         req_pool_indices = forward_batch.req_pool_indices
 
+        is_swa_layer = self._is_swa_layer(layer, forward_batch)
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
-        kv_repeat = layer.tp_q_head_num // layer.tp_k_head_num if use_gqa else 1
+        use_sliding_window = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+
+        if (
+            torch.compiler.is_compiling()
+            and extend_seq_lens is None
+            and is_swa_layer
+            and use_sliding_window
+        ):
+            self._forward_swa_decode_cached_kv_torch(
+                q, o, layer, forward_batch, seq_lens
+            )
+            return
 
         for seq_idx in range(seq_lens.shape[0]):
             seq_len_kv = int(seq_lens[seq_idx].item())
@@ -206,44 +281,39 @@ class IntelAMXAttnBackend(AttentionBackend):
 
             end_q = start_q + seq_len_q
             req_pool_idx = req_pool_indices[seq_idx]
-            token_indices = req_to_token[req_pool_idx, :seq_len_kv].to(torch.long)
+
+            kv_start = 0
+            if use_sliding_window:
+                if extend_seq_lens is None:
+                    kv_start = max(0, seq_len_kv - layer.sliding_window_size - 1)
+                else:
+                    kv_start = max(0, prefix_len - layer.sliding_window_size)
+            token_indices = req_to_token[req_pool_idx, kv_start:seq_len_kv].to(
+                torch.long
+            )
+            if is_swa_layer:
+                token_indices = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    token_indices
+                ).to(torch.long)
 
             per_req_q = q[start_q:end_q].transpose(0, 1).unsqueeze(0)
             per_req_k = k_buffer[token_indices].transpose(0, 1).unsqueeze(0)
             per_req_v = v_buffer[token_indices].transpose(0, 1).unsqueeze(0)
 
-            if use_gqa:
-                per_req_k = per_req_k.repeat_interleave(kv_repeat, dim=1)
-                per_req_v = per_req_v.repeat_interleave(kv_repeat, dim=1)
-
             attn_mask = None
             if (
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
-                and (
-                    extend_seq_lens is not None
-                    or (
-                        layer.sliding_window_size is not None
-                        and layer.sliding_window_size > -1
-                    )
-                )
+                and extend_seq_lens is not None
             ):
-                if extend_seq_lens is None:
-                    q_pos = torch.full(
-                        (seq_len_q,), seq_len_kv - 1, device=q.device
-                    )
-                else:
-                    q_pos = torch.arange(
-                        prefix_len,
-                        prefix_len + seq_len_q,
-                        device=q.device,
-                    )
-                kv_pos = torch.arange(seq_len_kv, device=q.device)
+                q_pos = torch.arange(
+                    prefix_len,
+                    prefix_len + seq_len_q,
+                    device=q.device,
+                )
+                kv_pos = torch.arange(kv_start, seq_len_kv, device=q.device)
                 attn_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-                if (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
-                ):
+                if use_sliding_window:
                     attn_mask = attn_mask & (
                         kv_pos.unsqueeze(0)
                         >= q_pos.unsqueeze(1) - layer.sliding_window_size
@@ -256,6 +326,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 attn_mask=attn_mask,
                 dropout_p=0.0,
                 scale=layer.scaling,
+                enable_gqa=use_gqa,
             )
             o[start_q:end_q].copy_(per_req_o.squeeze(0).transpose(0, 1))
 
@@ -357,7 +428,15 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        if self._use_torch_cached_kv(layer, k, v):
+        use_torch_cached_kv = self._use_torch_cached_kv(layer, k, v)
+        use_sliding_window = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+        if use_torch_cached_kv and k is None and v is None and not use_sliding_window:
+            k, v = self._get_cached_current_kv(layer, forward_batch)
+            use_torch_cached_kv = False
+
+        if use_torch_cached_kv:
             if save_kv_cache and k is not None and v is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v

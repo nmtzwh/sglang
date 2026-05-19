@@ -48,6 +48,11 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
     return pad_size
 
 
+def _set_attr_if_present(config, attr_name, value):
+    if hasattr(config, attr_name):
+        setattr(config, attr_name, value)
+
+
 def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
     # is_post_update: whether to update an existing config
     from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
@@ -87,13 +92,16 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
 
 
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
-    attr_value = intermediate_padding_size
+    attr_value = None
     if hasattr(model_config, "hf_config") and hasattr(
         model_config.hf_config, attr_name
     ):
         attr_value = getattr(model_config.hf_config, attr_name)
     elif hasattr(model_config, attr_name):
         attr_value = getattr(model_config, attr_name)
+
+    if attr_value is None:
+        return model_config
 
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
@@ -169,6 +177,22 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.hf_config.num_attention_heads = num_attention_heads
         model_config.hf_text_config.num_attention_heads = num_attention_heads
 
+        if getattr(model_config.hf_text_config, "model_type", None) in (
+            "gemma4",
+            "gemma4_text",
+            "gemma4_assistant",
+        ) and hasattr(model_config.hf_text_config, "swa_num_key_value_heads"):
+            original_swa_kv_heads = model_config.hf_text_config.swa_num_key_value_heads
+            if original_swa_kv_heads != total_kv_heads:
+                raise ValueError(
+                    "CPU tensor parallel padding for Gemma4 configs with different "
+                    "full-attention and sliding-window KV head counts is not supported"
+                )
+            model_config.hf_text_config.swa_num_key_value_heads = num_key_value_heads
+            _set_attr_if_present(
+                model_config.hf_config, "swa_num_key_value_heads", num_key_value_heads
+            )
+
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
@@ -184,10 +208,8 @@ def adjust_config_with_unaligned_cpu_tp(
     model_config = update_intermediate_size(
         model_config, "shared_expert_intermediate_size", intermediate_padding_size
     )
-    if (
-        hasattr(model_config.hf_config, "vision_config")
-        and model_config.hf_config.vision_config.model_type == "siglip_vision_model"
-    ):
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    if getattr(vision_config, "model_type", None) == "siglip_vision_model":
         model_config.hf_config.vision_config.original_num_attention_heads = (
             model_config.num_attention_heads
         )
@@ -198,7 +220,11 @@ def adjust_config_with_unaligned_cpu_tp(
             )
             from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+            pad_size = get_num_heads_padding_size(
+                tp_size,
+                weight_block_size,
+                model_config.hf_config.vision_config.head_dim,
+            )
             model_config.hf_config.vision_config.num_attention_heads = pad_vocab_size(
                 model_config.hf_config.vision_config.num_attention_heads, pad_size
             )

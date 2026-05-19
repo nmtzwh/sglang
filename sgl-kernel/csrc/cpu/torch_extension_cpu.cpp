@@ -34,6 +34,12 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor gemma4_rmsnorm_residual_cpu(
+    at::Tensor& input,
+    at::Tensor& weight,
+    at::Tensor& residual,
+    double scalar,
+    double eps);
 
 // layernorm
 void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
@@ -353,6 +359,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_rmsnorm_cpu", torch::kCPU, &gemma_rmsnorm_cpu);
   m.def("gemma3_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("gemma3_rmsnorm_cpu", torch::kCPU, &gemma3_rmsnorm_cpu);
+  m.def("gemma4_rmsnorm_residual_cpu(Tensor input, Tensor weight, Tensor residual, float scalar, float eps) -> Tensor");
+  m.impl("gemma4_rmsnorm_residual_cpu", torch::kCPU, &gemma4_rmsnorm_residual_cpu);
   m.def("layernorm_cpu(Tensor(a!) input, Tensor weight, float eps) -> ()");
   m.impl("layernorm_cpu", torch::kCPU, &layernorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");

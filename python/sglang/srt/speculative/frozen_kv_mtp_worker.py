@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
@@ -75,6 +75,14 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import empty_context
 
 logger = logging.getLogger(__name__)
+
+
+def _set_time_batch_if_available(reqs, set_func: str) -> None:
+    if reqs is None or len(reqs) == 0:
+        return
+    if not hasattr(reqs[0].time_stats, set_func):
+        return
+    set_time_batch(reqs, set_func)
 
 
 class FrozenKVMTPWorker(TpModelWorker):
@@ -375,12 +383,14 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         forward_mode_backup = batch.forward_mode
         input_ids_backup = batch.input_ids
+        out_cache_loc_backup = batch.out_cache_loc
         return_hidden_states_backup = batch.return_hidden_states
         return_logprob_backup = batch.return_logprob
         spec_info_backup = batch.spec_info
 
         batch.forward_mode = ForwardMode.DECODE
         batch.input_ids = draft_input.verified_id
+        batch.out_cache_loc = self._last_target_cache_locs(batch)
         batch.return_hidden_states = False
         batch.return_logprob = False
         batch.spec_info = draft_input
@@ -406,6 +416,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         finally:
             batch.forward_mode = forward_mode_backup
             batch.input_ids = input_ids_backup
+            batch.out_cache_loc = out_cache_loc_backup
             batch.return_hidden_states = return_hidden_states_backup
             batch.return_logprob = return_logprob_backup
             # Keep the seeded draft state; only restore the old object on error paths
@@ -434,17 +445,17 @@ class FrozenKVMTPWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_accepted_tokens=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+        _set_time_batch_if_available(batch.reqs, "set_spec_draft_start_time")
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             spec_info = self.draft(batch)
-        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
-        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+        _set_time_batch_if_available(batch.reqs, "set_spec_draft_end_time")
+        _set_time_batch_if_available(batch.reqs, "set_spec_verify_start_time")
 
         logits_output, verify_output, _, can_run_cuda_graph = self.verify(
             batch, spec_info
@@ -452,10 +463,11 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
-                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                accepted = verify_output.accept_length_per_req_cpu[idx]
+                if hasattr(req.time_stats, "set_spec_verify_end_time"):
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
-        set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+        _set_time_batch_if_available(batch.reqs, "set_spec_draft_extend_start_time")
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -464,13 +476,13 @@ class FrozenKVMTPWorker(TpModelWorker):
                 or batch.spec_info.verified_id.numel()
             ):
                 self.forward_draft_extend_after_decode(batch)
-        set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+        _set_time_batch_if_available(batch.reqs, "set_spec_draft_extend_end_time")
 
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.verified_id,
-            num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-            num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -573,6 +585,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
+        batch.out_cache_loc = self._last_target_cache_locs(batch)
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
 
@@ -584,8 +597,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
-        can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
+        can_run_cuda_graph = (
+            self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
@@ -600,9 +613,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         (
             tree_mask,
             position,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
@@ -620,10 +633,10 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_cum_len=None,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -632,11 +645,50 @@ class FrozenKVMTPWorker(TpModelWorker):
             seq_lens_cpu=batch.seq_lens_cpu,
         )
 
+    def _last_target_cache_locs(self, batch: ScheduleBatch) -> torch.Tensor:
+        if self.page_size != 1 and self.device == "cpu":
+            raise NotImplementedError(
+                "CPU Frozen-KV MTP currently supports page_size=1 target cache "
+                "location lookup only."
+            )
+
+        last_token_pos = torch.clamp(batch.seq_lens - 1, min=0).to(torch.long)
+        cache_locs = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, last_token_pos
+        ].to(torch.int64)
+        if self.topk > 1:
+            cache_locs = cache_locs.repeat_interleave(self.topk, dim=0)
+        return cache_locs
+
+    def _draft_step_cache_locs(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        out_cache_loc = forward_batch.out_cache_loc
+        batch_size = forward_batch.batch_size
+        if out_cache_loc.numel() == batch_size:
+            return out_cache_loc.reshape(1, batch_size).expand(
+                self.speculative_num_steps, batch_size
+            )
+
+        expected = batch_size * self.speculative_num_steps
+        if out_cache_loc.numel() != expected:
+            raise RuntimeError(
+                "Frozen-KV MTP draft cache locations must contain either one "
+                "target cache location per active draft sequence or one location "
+                f"per draft step. Got {out_cache_loc.numel()} locations for "
+                f"batch_size={batch_size}, steps={self.speculative_num_steps}."
+            )
+
+        return (
+            out_cache_loc.reshape(batch_size, self.speculative_num_steps)
+            .transpose(0, 1)
+            .contiguous()
+        )
+
     def draft_forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
+        step_cache_locs = self._draft_step_cache_locs(forward_batch)
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -664,6 +716,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 break
 
             forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = step_cache_locs[i]
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
@@ -707,10 +760,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
+            retrive_next_token_cpu = spec_info.retrive_next_token.cpu()
+            retrive_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrieve_next_token.shape
+                spec_info.retrive_next_token.shape
             ).cpu()
 
         batch_result = self.target_worker.forward_batch_generation(
@@ -726,14 +779,14 @@ class FrozenKVMTPWorker(TpModelWorker):
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
                 spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
+                retrive_next_token_cpu,
+                retrive_next_sibling_cpu,
                 draft_tokens_cpu,
                 batch.sampling_info.vocab_size,
             )
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
+                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
