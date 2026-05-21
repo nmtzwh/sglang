@@ -65,9 +65,10 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_hip = is_hip()
 
@@ -325,7 +326,21 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return []
 
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if hf_quant_cfg is None:
+            return None
+        quant_method = hf_quant_cfg.get("quant_method")
+        if quant_method in ("compressed-tensors", "compressed_tensors"):
+            return "compressed-tensors"
+        if "config_groups" in hf_quant_cfg and "format" in hf_quant_cfg:
+            return "compressed-tensors"
+        return None
+
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if not _is_cuda:
+            return False
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -433,6 +448,19 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_symmetric_activation = input_quant.symmetric
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
+
+    def _is_cpu_fp8_block_weight_only(
+        self, weight_quant: Optional[QuantizationArgs]
+    ) -> bool:
+        return (
+            (_is_cpu or (not _is_cuda and not _is_hip and not _is_npu))
+            and weight_quant is not None
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and weight_quant.strategy == QuantizationStrategy.BLOCK
+        )
 
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.
@@ -560,6 +588,14 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
         if is_activation_quantization_format(self.quant_format):
+            if self._is_cpu_fp8_block_weight_only(weight_quant):
+                return CompressedTensorsW8A8Fp8(
+                    weight_quant=weight_quant,
+                    input_quant=input_quant,
+                    is_static_input_scheme=False,
+                    use_cpu_fp8_kernel=True,
+                )
+
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -572,12 +608,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
+                if (
+                    (_is_cpu or (not _is_cuda and not _is_hip and not _is_npu))
+                    and weight_quant.strategy == QuantizationStrategy.BLOCK
+                ):
+                    return CompressedTensorsW8A8Fp8(
+                        weight_quant=weight_quant,
+                        input_quant=input_quant,
+                        is_static_input_scheme=False,
+                        use_cpu_fp8_kernel=True,
+                    )
+
                 is_fp8_w8a8_supported = self._check_scheme_supported(
                     CompressedTensorsW8A8Fp8.get_min_capability(), error=False
                 )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
+                        input_quant=input_quant,
                         is_static_input_scheme=(
                             input_quant and not input_quant.dynamic
                         ),
@@ -792,6 +840,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 
+    def _get_single_cpu_fp8_block_scheme_dict(
+        self,
+    ) -> Optional[dict[str, QuantizationArgs | str | None]]:
+        if not (_is_cpu or (not _is_cuda and not _is_hip and not _is_npu)):
+            return None
+
+        fp8_block_scheme_dict = None
+        for scheme_dict in self.target_scheme_map.values():
+            weight_quant = scheme_dict.get("weights") if scheme_dict else None
+            if not self._is_cpu_fp8_block_weight_only(weight_quant):
+                continue
+            if fp8_block_scheme_dict is not None and scheme_dict != fp8_block_scheme_dict:
+                return None
+            fp8_block_scheme_dict = scheme_dict
+
+        return fp8_block_scheme_dict
+
     def get_scheme_dict(
         self, layer: torch.nn.Module, layer_name: str | None = None
     ) -> dict[str, QuantizationArgs | str | None] | None:
@@ -812,12 +877,23 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=self.target_scheme_map.keys(),
-                fused_mapping=self.packed_modules_mapping,
-            )
+            try:
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
+                    module=layer,
+                    targets=self.target_scheme_map.keys(),
+                    fused_mapping=self.packed_modules_mapping,
+                )
+            except ValueError:
+                scheme_dict = self._get_single_cpu_fp8_block_scheme_dict()
+                if scheme_dict is not None:
+                    logger.warning_once(
+                        "Unable to match %s against compressed-tensors targets; "
+                        "using the single CPU FP8_BLOCK linear scheme.",
+                        layer_name,
+                    )
+                    return scheme_dict
+                raise
 
             return self.target_scheme_map[matched_target]
 

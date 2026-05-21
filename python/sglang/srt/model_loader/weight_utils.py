@@ -182,6 +182,11 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]],
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
+    def get_config_attr(config, key):
+        if isinstance(config, dict):
+            return config.get(key)
+        return getattr(config, key, None)
+
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -189,14 +194,16 @@ def get_quant_config(
         return quant_cls.from_config({})
 
     # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    hf_quant_config = get_config_attr(model_config.hf_config, "quantization_config")
     # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
+    hf_text_config = get_config_attr(model_config.hf_config, "text_config")
     if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
+        hf_quant_config = get_config_attr(hf_text_config, "quantization_config")
     if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+        # compressed-tensors uses a compression_config
+        hf_quant_config = get_config_attr(model_config.hf_config, "compression_config")
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = get_config_attr(hf_text_config, "compression_config")
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()

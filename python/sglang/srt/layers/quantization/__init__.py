@@ -76,6 +76,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
+BASE_QUANTIZATION_METHODS["compressed_tensors"] = CompressedTensorsConfig
 
 
 if is_cuda() or (_is_mxfp_supported and is_hip()):

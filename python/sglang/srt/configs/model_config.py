@@ -39,6 +39,15 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 
+def _copy_quant_config_to_text_config(hf_config, hf_text_config) -> None:
+    for quant_config_attr in ("quantization_config", "compression_config"):
+        quant_config_value = getattr(hf_config, quant_config_attr, None)
+        if quant_config_value is not None and getattr(
+            hf_text_config, quant_config_attr, None
+        ) is None:
+            setattr(hf_text_config, quant_config_attr, quant_config_value)
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
@@ -159,6 +168,7 @@ class ModelConfig:
             not enable_multimodal
             and self.hf_config.architectures[0] == "Gemma4ForConditionalGeneration"
         ):
+            _copy_quant_config_to_text_config(self.hf_config, self.hf_text_config)
             if hasattr(self.hf_text_config, "update"):
                 self.hf_text_config.update({"architectures": ["Gemma4ForCausalLM"]})
             else:
@@ -699,7 +709,12 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
-        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        def get_config_attr(config, key):
+            if isinstance(config, dict):
+                return config.get(key)
+            return getattr(config, key, None)
+
+        quant_cfg = get_config_attr(self.hf_config, "quantization_config")
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
@@ -716,7 +731,13 @@ class ModelConfig:
 
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
-            quant_cfg = getattr(self.hf_config, "compression_config", None)
+            quant_cfg = get_config_attr(self.hf_config, "compression_config")
+        if quant_cfg is None:
+            hf_text_config = get_config_attr(self.hf_config, "text_config")
+            if hf_text_config is not None:
+                quant_cfg = get_config_attr(hf_text_config, "compression_config")
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
         if quant_cfg is None:
             # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory

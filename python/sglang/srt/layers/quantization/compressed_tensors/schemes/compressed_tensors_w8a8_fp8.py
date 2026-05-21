@@ -7,6 +7,7 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -25,11 +26,17 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_hip,
+    is_host_cpu_arm64,
+)
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support() or is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -43,12 +50,20 @@ strategy_to_parameter_type = {
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
-    def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        is_static_input_scheme: bool,
+        input_quant: Optional[QuantizationArgs] = None,
+        use_cpu_fp8_kernel: bool = False,
+    ):
         self.weight_quant = weight_quant
+        self.input_quant = input_quant
         self.strategy = self.weight_quant.strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.weight_block_size = self.weight_quant.block_structure
-        if self.weight_block_size is not None:
+        self.use_cpu_fp8_kernel = use_cpu_fp8_kernel
+        if self.weight_block_size is not None and not self.use_cpu_fp8_kernel:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     @classmethod
@@ -196,6 +211,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
             layer.weight = Parameter(weight.data, requires_grad=False)
             layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+            if self.use_cpu_fp8_kernel:
+                assert _is_cpu_amx_available, (
+                    "compressed-tensors FP8_BLOCK on CPU requires AMX support "
+                    "for the native fp8_scaled_mm_cpu kernel."
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+                layer.weight_scale_inv = Parameter(
+                    layer.weight_scale.data, requires_grad=False
+                )
+                layer.weight_scale_inv.format_ue8m0 = getattr(
+                    layer.weight_scale, "format_ue8m0", False
+                )
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -213,6 +240,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
+            if self.use_cpu_fp8_kernel:
+                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                    x,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.weight_block_size,
+                    bias,
+                    x.dtype,
+                    True,  # is_vnni
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
