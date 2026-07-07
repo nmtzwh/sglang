@@ -1036,6 +1036,7 @@ void shared_expert_kernel_impl(
 static inline void check_moe_scales(
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
+    bool use_fp8_w8a16_channel,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size) {
@@ -1048,6 +1049,11 @@ static inline void check_moe_scales(
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
     TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
     TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+  }
+  if (use_fp8_w8a16_channel) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for channelwise fp8 w8a16.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for channelwise fp8 w8a16.");
+    TORCH_CHECK(!block_size.has_value(), "channelwise fp8 w8a16 does not use block_size.");
   }
 }
 
@@ -1138,6 +1144,7 @@ at::Tensor fused_experts_cpu(
   check_moe_scales(
       moe_comp_method == CPUQuantMethod::INT8_W8A8,
       moe_comp_method == CPUQuantMethod::FP8_W8A16,
+      moe_comp_method == CPUQuantMethod::FP8_W8A16_CHANNEL,
       w1_scale,
       w2_scale,
       block_size);
@@ -1205,7 +1212,8 @@ at::Tensor fused_experts_cpu(
   if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
+  if (moe_comp_method == CPUQuantMethod::FP8_W8A16 ||
+      moe_comp_method == CPUQuantMethod::FP8_W8A16_CHANNEL) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
@@ -1252,14 +1260,44 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
+    } else if (
+        moe_comp_method == CPUQuantMethod::FP8_W8A16 ||
+        moe_comp_method == CPUQuantMethod::FP8_W8A16_CHANNEL) {
       // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
 
-      CHECK_MOE_SCALES_FP8(1, 2);
+      const bool channelwise =
+          moe_comp_method == CPUQuantMethod::FP8_W8A16_CHANNEL;
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      if (channelwise) {
+        CHECK_INPUT(w1s);
+        CHECK_INPUT(w2s);
+        TORCH_CHECK(st == at::kBFloat16,
+            "channelwise fp8 MoE requires bfloat16 activations.");
+        TORCH_CHECK(w1s.scalar_type() == at::kFloat &&
+                w2s.scalar_type() == at::kFloat,
+            "channelwise fp8 MoE scales must be float32.");
+        TORCH_CHECK(w1s.sizes() == at::IntArrayRef({E, 2 * N, 1}),
+            "channelwise fp8 MoE w1_scale must have shape [E, 2N, 1].");
+        TORCH_CHECK(w2s.sizes() == at::IntArrayRef({E, K, 1}),
+            "channelwise fp8 MoE w2_scale must have shape [E, K, 1].");
+      } else {
+        auto block_size_val = block_size.value();
+        int64_t block_size_N = block_size_val[0];
+        int64_t block_size_K = block_size_val[1];
+        TORCH_CHECK(w1s.size(1) == div_up(2 * N, block_size_N));
+        TORCH_CHECK(w1s.size(2) == div_up(K, block_size_K));
+        TORCH_CHECK(w2s.size(1) == div_up(K, block_size_N));
+        TORCH_CHECK(w2s.size(2) == div_up(N, block_size_K));
+      }
+      int64_t fp8_block_size_N =
+          channelwise ? block_size_n() : block_size.value()[0];
+      int64_t fp8_block_size_K =
+          channelwise ? BLOCK_K : block_size.value()[1];
       fused_experts_fp8_kernel_impl(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
@@ -1273,8 +1311,9 @@ at::Tensor fused_experts_cpu(
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
-          block_size_N,
-          block_size_K,
+          fp8_block_size_N,
+          fp8_block_size_K,
+          channelwise,
           topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
@@ -1407,7 +1446,7 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size);
+  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, false, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 

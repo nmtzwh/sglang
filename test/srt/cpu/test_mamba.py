@@ -382,6 +382,116 @@ class TestMambaAttention(CustomTestCase):
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
         )
 
+    def test_fused_gdn_gating_noncontiguous_ab(self):
+        batch_size = 4
+        num_heads = 8
+        mixed_ba = torch.randn(
+            batch_size, 2 * num_heads, dtype=torch.bfloat16
+        )
+        b, a = mixed_ba.split(num_heads, dim=-1)
+        self.assertFalse(a.is_contiguous())
+        self.assertFalse(b.is_contiguous())
+        A_log = torch.randn(num_heads, dtype=torch.float32)
+        dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
+
+        g, beta = torch.ops.sgl_kernel.fused_gdn_gating_cpu(
+            A_log, a, b, dt_bias
+        )
+        g_ref = (
+            -A_log.float().exp()
+            * F.softplus(a.float() + dt_bias.float())
+        ).unsqueeze(0)
+        beta_ref = b.float().sigmoid().to(b.dtype).unsqueeze(0)
+
+        torch.testing.assert_close(g, g_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(beta, beta_ref, atol=1e-2, rtol=1e-2)
+
+    def test_fused_sigmoid_gating_batched_beta(self):
+        batch_size, seq_len = 2, 1
+        num_heads, num_value_heads = 1, 2
+        head_k_dim = head_v_dim = 8
+        q = torch.randn(
+            seq_len,
+            batch_size,
+            num_heads,
+            head_k_dim,
+            dtype=torch.bfloat16,
+        )
+        k = torch.randn_like(q)
+        v = torch.randn(
+            seq_len,
+            batch_size,
+            num_value_heads,
+            head_v_dim,
+            dtype=torch.bfloat16,
+        )
+        a = torch.randn(batch_size, num_value_heads, dtype=torch.bfloat16)
+        # Opposite gates make accidental reuse of request 0's beta obvious.
+        b = torch.tensor([[-8.0, -8.0], [8.0, 8.0]], dtype=torch.bfloat16)
+        A_log = torch.randn(num_value_heads, dtype=torch.float32)
+        dt_bias = torch.randn(num_value_heads, dtype=torch.bfloat16)
+        states = torch.zeros(
+            batch_size,
+            num_value_heads,
+            head_k_dim,
+            head_v_dim,
+            dtype=torch.float32,
+        )
+        indices = torch.arange(batch_size, dtype=torch.int32)
+        cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int32)
+
+        output = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            states,
+            indices,
+            cu_seqlens,
+            False,
+            1.0,
+            20.0,
+        )
+
+        outputs_ref = []
+        states_ref = []
+        for batch_idx in range(batch_size):
+            state = torch.zeros(
+                1,
+                num_value_heads,
+                head_k_dim,
+                head_v_dim,
+                dtype=torch.float32,
+            )
+            outputs_ref.append(
+                torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                    A_log,
+                    dt_bias,
+                    q[:, batch_idx : batch_idx + 1],
+                    k[:, batch_idx : batch_idx + 1],
+                    v[:, batch_idx : batch_idx + 1],
+                    a[batch_idx : batch_idx + 1],
+                    b[batch_idx : batch_idx + 1],
+                    state,
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.tensor([0, 1], dtype=torch.int32),
+                    False,
+                    1.0,
+                    20.0,
+                )
+            )
+            states_ref.append(state)
+
+        torch.testing.assert_close(
+            output, torch.cat(outputs_ref, dim=0), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            states, torch.cat(states_ref, dim=0), atol=1e-4, rtol=1e-4
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

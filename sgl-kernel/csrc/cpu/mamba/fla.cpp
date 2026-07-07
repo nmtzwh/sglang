@@ -842,6 +842,8 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     int64_t v_strideB,
     int64_t v_strideS,
     int64_t v_strideH,
+    int64_t a_strideB,
+    int64_t b_strideB,
     bool use_qk_l2norm_in_kernel,
     double softplus_threshold) {
   using bVec = sgl_vec::Vectorized<scalar_t>;
@@ -904,7 +906,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
       int64_t cache_index = indices_ptr[bi];
       int64_t state_offset = (cache_index * v_num_heads + ni) * head_dim * v_head_dim;
       float g_val = -std::exp(A_log_ptr[ni]) *
-                    softplus(float(a_ptr[bi * v_num_heads + ni]) + float(dt_bias_ptr[ni]), softplus_threshold);
+                    softplus(float(a_ptr[bi * a_strideB + ni]) + float(dt_bias_ptr[ni]), softplus_threshold);
       float g_val_exp = std::exp(g_val);
       fVec g_val_exp_vec = fVec(g_val_exp);
       int64_t q_offset = si * q_strideS + bi * q_strideB + (ni / group_size) * q_strideH;
@@ -915,7 +917,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
       float k_scale = use_qk_l2norm_in_kernel ? qk_scale_buf[k_scale_offset] : 1.0f;
       int64_t v_offset = si * v_strideS + bi * v_strideB + ni * v_strideH;
       int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
-      float beta_val = 1 / (1 + std::exp(-b_ptr[ni]));
+      float beta_val = 1 / (1 + std::exp(-b_ptr[bi * b_strideB + ni]));
       fVec beta_vec = fVec(beta_val);
       int64_t dvi = 0;
       for (; dvi <= v_head_dim - VecSize; dvi += VecSize) {
@@ -982,7 +984,9 @@ void fused_gdn_gating_kernel_impl(
     float* __restrict__ out,
     scalar_t* __restrict__ beta,
     int64_t batch,
-    int64_t num_heads) {
+    int64_t num_heads,
+    int64_t a_strideB,
+    int64_t b_strideB) {
   using bVec = sgl_vec::Vectorized<scalar_t>;
   using fVec = sgl_vec::Vectorized<float>;
   constexpr int vec_size = bVec::size();
@@ -996,8 +1000,8 @@ void fused_gdn_gating_kernel_impl(
         fVec A_log_vec0 = fVec::loadu(A_log + j);
         fVec A_log_vec1 = fVec::loadu(A_log + j + fvec_size);
         bVec dt_bias_vec = bVec::loadu(dt_bias + j);
-        bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
+        bVec a_bvec = bVec::loadu(a + i * a_strideB + j);
+        bVec b_bvec = bVec::loadu(b + i * b_strideB + j);
         fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
         std::tie(a0, a1) = sgl_vec::convert_to_float(a_bvec);
         std::tie(b0, b1) = sgl_vec::convert_to_float(b_bvec);
@@ -1014,8 +1018,11 @@ void fused_gdn_gating_kernel_impl(
         beta_vec.store(beta + i * num_heads + j);
       }
       for (; j < num_heads; ++j) {
-        out[i * num_heads + j] = -std::exp(A_log[j]) * softplus(float(a[i * num_heads + j]) + float(dt_bias[j]));
-        beta[i * num_heads + j] = 1 / (1 + std::exp(-b[i * num_heads + j]));
+        out[i * num_heads + j] =
+            -std::exp(A_log[j]) *
+            softplus(float(a[i * a_strideB + j]) + float(dt_bias[j]));
+        beta[i * num_heads + j] =
+            1 / (1 + std::exp(-b[i * b_strideB + j]));
       }
     }
   });
@@ -1300,6 +1307,8 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
         v_strideB,
         v_strideS,
         v_strideH,
+        a.stride(0),
+        b.stride(0),
         use_qk_l2norm_in_kernel,
         softplus_threshold);
   });
@@ -1318,7 +1327,8 @@ fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Ten
   CHECK_DIM(2, a);
   CHECK_DIM(2, b);
   CHECK_DIM(1, dt_bias);
-  CHECK_CONTIGUOUS(a);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(a);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(b);
   CHECK_EQ(A_log.size(0), a.size(1));
   CHECK_EQ(A_log.size(0), dt_bias.size(0));
   at::Tensor A_log_float = A_log.to(at::kFloat);
@@ -1337,7 +1347,9 @@ fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Ten
         out.data_ptr<float>(),
         beta.data_ptr<scalar_t>(),
         batch,
-        num_heads);
+        num_heads,
+        a.stride(0),
+        b.stride(0));
   });
   return std::make_tuple(out, beta);
 }

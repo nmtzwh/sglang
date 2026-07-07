@@ -7,6 +7,10 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import (
+    CPUQuantMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -48,9 +52,12 @@ logger = logging.getLogger(__name__)
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
-    def __init__(self, weight_quant, input_quant):
+    def __init__(
+        self, weight_quant, input_quant, use_cpu_fp8_kernel: bool = False
+    ):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        self.use_cpu_fp8_kernel = use_cpu_fp8_kernel
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
 
         per_tensor = (
@@ -300,6 +307,21 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
+        if (
+            self.use_cpu_fp8_kernel
+            and self.weight_quant.strategy
+            in (QuantizationStrategy.CHANNEL, QuantizationStrategy.BLOCK)
+        ):
+            layer.w13_weight_scale = torch.nn.Parameter(
+                layer.w13_weight_scale.data.contiguous(), requires_grad=False
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                layer.w2_weight_scale.data.contiguous(), requires_grad=False
+            )
+            _amx_process_weight_after_loading(
+                layer, ["w13_weight", "w2_weight"]
+            )
+
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
@@ -317,6 +339,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
             and self.use_flashinfer_trtllm
+            and not self.use_cpu_fp8_kernel
         ):
             layer.w13_weight = torch.nn.Parameter(
                 swap_w13_to_w31(layer.w13_weight.data),
@@ -331,6 +354,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_cpu_fp8_kernel:
+            self.runner = None
+            return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
@@ -349,7 +375,34 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+        if self.use_cpu_fp8_kernel:
+            assert not moe_runner_config.no_combine, "unsupported"
+            assert not moe_runner_config.apply_router_weight_on_input, "unsupported"
+            topk_weights, topk_ids, _ = topk_output
+            channelwise = (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            )
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids.to(torch.int32),
+                False,
+                (
+                    CPUQuantMethod.FP8_W8A16_CHANNEL
+                    if channelwise
+                    else CPUQuantMethod.FP8_W8A16
+                ),
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                None,
+                None,
+                None if channelwise else self.weight_block_size,
+                True,
+            )
+            return StandardCombineInput(hidden_states=output)
+        elif _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
             assert not moe_runner_config.no_combine, "unsupported"
             topk_weights, topk_ids, _ = topk_output
             if moe_runner_config.apply_router_weight_on_input:

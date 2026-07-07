@@ -521,6 +521,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
         input_quant_none = input_quant is None
+        is_integer = weight_quant.type == QuantizationType.INT
         is_symmetric = weight_quant.symmetric
         is_channel_group = (
             weight_quant.strategy == QuantizationStrategy.CHANNEL.value
@@ -528,7 +529,31 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        return (
+            is_integer
+            and is_channel_group
+            and input_quant_none
+            and is_symmetric
+            and is_static
+        )
+
+    def _is_cpu_fp8_dynamic_channel(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
+        return (
+            (_is_cpu or (not _is_cuda and not _is_hip and not _is_npu))
+            and weight_quant is not None
+            and input_quant is not None
+            and weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and input_quant.num_bits == 8
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and input_quant.dynamic
+            and input_quant.strategy == QuantizationStrategy.TOKEN
+        )
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -608,6 +633,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
+                if self._is_cpu_fp8_dynamic_channel(weight_quant, input_quant):
+                    return CompressedTensorsW8A8Fp8(
+                        weight_quant=weight_quant,
+                        input_quant=input_quant,
+                        is_static_input_scheme=False,
+                        use_cpu_fp8_kernel=True,
+                    )
+                if (
+                    _is_cpu or (not _is_cuda and not _is_hip and not _is_npu)
+                ) and weight_quant.strategy != QuantizationStrategy.BLOCK:
+                    raise NotImplementedError(
+                        "CPU compressed-tensors FP8 supports only FP8_BLOCK or "
+                        "static channel-wise weights with dynamic token-wise "
+                        "activations."
+                    )
                 if (
                     (_is_cpu or (not _is_cuda and not _is_hip and not _is_npu))
                     and weight_quant.strategy == QuantizationStrategy.BLOCK
@@ -640,6 +680,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             # note: input_quant can be None
             if self._is_fp8_w8a16(weight_quant, input_quant):
+                if _is_cpu or (not _is_cuda and not _is_hip and not _is_npu):
+                    raise NotImplementedError(
+                        "CPU compressed-tensors weight-only FP8 tensor/channel "
+                        "schemes are unsupported; FP8_DYNAMIC requires dynamic "
+                        "token-wise activation metadata."
+                    )
                 is_static_input_scheme = input_quant and not input_quant.dynamic
                 return CompressedTensorsW8A16Fp8(
                     strategy=weight_quant.strategy,
@@ -743,6 +789,21 @@ class CompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if self._is_cpu_fp8_dynamic_channel(weight_quant, input_quant):
+                logger.info_once("Using CPU CompressedTensorsW8A8Fp8MoE")
+                return CompressedTensorsW8A8Fp8MoE(
+                    weight_quant, input_quant, use_cpu_fp8_kernel=True
+                )
+            if self._is_cpu_fp8_block_weight_only(weight_quant):
+                logger.info_once("Using CPU CompressedTensorsW8A8Fp8MoE (FP8_BLOCK)")
+                return CompressedTensorsW8A8Fp8MoE(
+                    weight_quant, input_quant, use_cpu_fp8_kernel=True
+                )
+            if _is_cpu or (not _is_cuda and not _is_hip and not _is_npu):
+                raise NotImplementedError(
+                    "CPU compressed-tensors FP8 MoE supports only FP8_BLOCK or "
+                    "static channel-wise weights with dynamic token-wise activations."
+                )
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):

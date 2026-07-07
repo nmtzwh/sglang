@@ -189,7 +189,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
+            if self.use_cpu_fp8_kernel:
+                assert _is_cpu_amx_available, (
+                    "compressed-tensors FP8 channel weights on CPU require "
+                    "native AVX512/AMX or SVE support."
+                )
+                layer.weight = Parameter(weight.data, requires_grad=False)
+                _amx_process_weight_after_loading(layer, ["weight"])
+            elif _use_aiter:
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
@@ -198,7 +205,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
             # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            layer.weight_scale = Parameter(
+                weight_scale.contiguous(), requires_grad=False
+            )
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -258,6 +267,19 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+            )
+
+        if (
+            self.use_cpu_fp8_kernel
+            and self.strategy == QuantizationStrategy.CHANNEL
+        ):
+            return torch.ops.sgl_kernel.fp8_channelwise_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,
             )
 
         if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:

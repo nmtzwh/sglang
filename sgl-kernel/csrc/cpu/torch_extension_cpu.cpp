@@ -178,6 +178,14 @@ at::Tensor fp8_scaled_mm_cpu(
     at::ScalarType out_dtype,
     bool is_vnni);
 
+at::Tensor fp8_channelwise_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& channel_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
+
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -447,6 +455,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+
+  m.def(
+      "fp8_channelwise_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor channel_scales, Tensor? bias, ScalarType "
+      "out_dtype, bool is_vnni) -> Tensor");
+  m.impl("fp8_channelwise_scaled_mm_cpu", torch::kCPU, &fp8_channelwise_scaled_mm_cpu);
 
   // quant + igemm
   m.def(

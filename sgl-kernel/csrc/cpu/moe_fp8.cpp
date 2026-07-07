@@ -37,6 +37,59 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
   }
 }
 
+template <typename scalar_t>
+inline void copy_scale_mul_stub(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const float* __restrict__ scale,
+    float weight,
+    int64_t size) {
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kFloatVecSize = fVec::size();
+  const fVec weight_vec(weight);
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    bVec x = bVec::loadu(input + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x);
+    x0 *= fVec::loadu(scale + d) * weight_vec;
+    x1 *= fVec::loadu(scale + d + kFloatVecSize) * weight_vec;
+    convert_from_float_ext<scalar_t>(x0, x1).store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(
+        static_cast<float>(input[d]) * scale[d] * weight);
+  }
+}
+
+template <typename scalar_t>
+inline void scale_stub(
+    scalar_t* __restrict__ data,
+    const float* __restrict__ scale,
+    int64_t size) {
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kFloatVecSize = fVec::size();
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    bVec x = bVec::loadu(data + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x);
+    x0 *= fVec::loadu(scale + d);
+    x1 *= fVec::loadu(scale + d + kFloatVecSize);
+    convert_from_float_ext<scalar_t>(x0, x1).store(data + d);
+  }
+  for (; d < size; ++d) {
+    data[d] = static_cast<scalar_t>(
+        static_cast<float>(data[d]) * scale[d]);
+  }
+}
+
 // acc from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
@@ -151,6 +204,7 @@ void fused_experts_fp8_kernel_impl(
     const float* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
+    bool channelwise,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ expert_ids,
@@ -170,6 +224,8 @@ void fused_experts_fp8_kernel_impl(
   int64_t scale_size_N = div_up(2 * N, block_size_N);
   int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
+  std::vector<float> unit_scales(
+      channelwise ? div_up(std::max(K, N), block_size_K) : 0, 1.0f);
 
   const int64_t stride_e = 2 * N * K;
   const int64_t stride_n = K;
@@ -191,8 +247,10 @@ void fused_experts_fp8_kernel_impl(
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
-      const float* __restrict__ Bs =
-          w1s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
+      const float* __restrict__ Bs = channelwise
+          ? unit_scales.data()
+          : w1s + expert_id * scale_size_N * scale_size_K +
+              (nb / blocks_n_per_group) * scale_size_K;
 
       // do unpacking for the first row or a new expert
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
@@ -224,6 +282,15 @@ void fused_experts_fp8_kernel_impl(
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
+
+      if (channelwise) {
+        const float* channel_scale =
+            w1s + expert_id * 2 * N + nb * BLOCK_N;
+        for (int64_t m = 0; m < m_size; ++m) {
+          scalar_t* row = ic0 + (offset + m) * 2 * N + nb * BLOCK_N;
+          scale_stub(row, channel_scale, n_size);
+        }
+      }
     });
 
     if (use_brgemm) {
@@ -266,8 +333,10 @@ void fused_experts_fp8_kernel_impl(
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const float* __restrict__ Bs =
-          w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
+      const float* __restrict__ Bs = channelwise
+          ? unit_scales.data()
+          : w2s + expert_id * scale_size_N * scale_size_K +
+              (nb / blocks_n_per_group) * scale_size_K;
 
       // do unpacking for the first row or a new expert
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
@@ -295,7 +364,20 @@ void fused_experts_fp8_kernel_impl(
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
         float weight = topk_weights[index];
-        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+        if (channelwise) {
+          copy_scale_mul_stub(
+              ic2 + index * K + nb * BLOCK_N,
+              C + m * BLOCK_N,
+              w2s + expert_id * K + nb * BLOCK_N,
+              weight,
+              n_size);
+        } else {
+          copy_mul_stub(
+              ic2 + index * K + nb * BLOCK_N,
+              C + m * BLOCK_N,
+              weight,
+              n_size);
+        }
       }
     });
 
@@ -329,6 +411,7 @@ void fused_experts_fp8_kernel_impl(
       const float* __restrict__ w2s,                   \
       int64_t block_size_N,                            \
       int64_t block_size_K,                            \
+      bool channelwise,                                \
       const float* __restrict__ topk_weights,          \
       const int32_t* __restrict__ sorted_ids,          \
       const int32_t* __restrict__ expert_ids,          \

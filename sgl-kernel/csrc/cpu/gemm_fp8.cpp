@@ -43,6 +43,37 @@ inline void copy_add_stub(
   }
 }
 
+template <typename scalar_t>
+inline void scale_bias_stub(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ scale,
+    const float* __restrict__ bias,
+    int64_t size) {
+  using bVec = sgl_vec::Vectorized<scalar_t>;
+  using fVec = sgl_vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kFloatVecSize = fVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    bVec x = bVec::loadu(out + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = sgl_vec::convert_to_float(x);
+    x0 *= fVec::loadu(scale + d);
+    x1 *= fVec::loadu(scale + d + kFloatVecSize);
+    if (bias != nullptr) {
+      x0 += fVec::loadu(bias + d);
+      x1 += fVec::loadu(bias + d + kFloatVecSize);
+    }
+    convert_from_float_ext<scalar_t>(x0, x1).store(out + d);
+  }
+  for (; d < size; ++d) {
+    float value = static_cast<float>(out[d]) * scale[d];
+    out[d] = static_cast<scalar_t>(bias == nullptr ? value : value + bias[d]);
+  }
+}
+
 inline void unpack_B(
     at::BFloat16* __restrict__ Btmp,
     const at::Float8_e4m3fn* __restrict__ packed_B,
@@ -685,7 +716,8 @@ void fp8_scaled_mm_kernel_impl(
     int64_t out_strideM,
     int64_t block_size_N,
     int64_t block_size_K,
-    int64_t buffer_size_per_thread) {
+    int64_t buffer_size_per_thread,
+    bool channelwise = false) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -693,11 +725,12 @@ void fp8_scaled_mm_kernel_impl(
 
   const int64_t scale_size_K = div_up(K, block_size_K);
   const int64_t blocks_n_per_group = block_size_N / BLOCK_N;
+  std::vector<float> unit_scales(channelwise ? scale_size_K : 0, 1.0f);
 
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
   // parallel on [MB, NB]
-  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+  AT_DISPATCH_BOOL(bias != nullptr && !channelwise, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
       int tid = get_thread_num();
       scalar_t* __restrict__ Btmp = nullptr;
@@ -708,12 +741,13 @@ void fp8_scaled_mm_kernel_impl(
       }
 
       loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        const float* scale_ptr = scales2 + (nb / blocks_n_per_group) * scale_size_K;
-
         int64_t mb_start = mb * BLOCK_M;
         int64_t mb_size = std::min(M - mb_start, BLOCK_M);
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+        const float* scale_ptr = channelwise
+            ? unit_scales.data()
+            : scales2 + (nb / blocks_n_per_group) * scale_size_K;
 
         // only do unpacking for the first row
         bool do_unpack = (mb == mb0);
@@ -725,7 +759,7 @@ void fp8_scaled_mm_kernel_impl(
             /*   Btmp         */ Btmp == nullptr ? nullptr : Btmp + nb_offset * BLOCK_N * K,
             /*   Ctmp         */ Ctmp,
             /*   scale        */ scale_ptr,
-            /*   bias         */ bias == nullptr ? nullptr : bias + nb_start,
+            /*   bias         */ channelwise ? nullptr : (bias == nullptr ? nullptr : bias + nb_start),
             /*   M            */ mb_size,
             /*   N            */ nb_size,
             /*   K            */ K,
@@ -735,6 +769,16 @@ void fp8_scaled_mm_kernel_impl(
             /*   brg          */ use_brgemm,
             /*   block_size_K */ block_size_K,
             /*   do_unpack    */ do_unpack);
+
+        if (channelwise) {
+          for (int64_t m = 0; m < mb_size; ++m) {
+            scale_bias_stub(
+                out + (mb_start + m) * out_strideM + nb_start,
+                scales2 + nb_start,
+                bias == nullptr ? nullptr : bias + nb_start,
+                nb_size);
+          }
+        }
       });
 
       if (use_brgemm) {
@@ -868,8 +912,86 @@ at::Tensor fp8_scaled_mm_cpu(
         out_strideM,
         block_size_N,
         block_size_K,
-        size_per_thread);
+        size_per_thread,
+        false);
   });
 
+  return out;
+}
+
+at::Tensor fp8_channelwise_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& channel_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni) {
+  RECORD_FUNCTION(
+      "sgl-kernel::fp8_channelwise_scaled_mm_cpu",
+      std::vector<c10::IValue>({mat1, mat2, channel_scales, bias}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_INPUT(channel_scales);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  const int64_t N = mat2.size(0);
+  const int64_t K = mat2.size(1);
+  TORCH_CHECK(mat1.scalar_type() == at::kBFloat16,
+      "fp8_channelwise_scaled_mm_cpu: runtime activations must be bfloat16.");
+  TORCH_CHECK(out_dtype == at::kBFloat16,
+      "fp8_channelwise_scaled_mm_cpu: output dtype must be bfloat16.");
+  TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn,
+      "fp8_channelwise_scaled_mm_cpu: weight must be float8_e4m3fn.");
+  TORCH_CHECK(channel_scales.scalar_type() == at::kFloat,
+      "fp8_channelwise_scaled_mm_cpu: channel_scales must be float32.");
+  TORCH_CHECK(
+      channel_scales.dim() == 1 || (channel_scales.dim() == 2 && channel_scales.size(1) == 1),
+      "fp8_channelwise_scaled_mm_cpu: channel_scales must have shape [N] or [N, 1].");
+  TORCH_CHECK(channel_scales.numel() == N,
+      "fp8_channelwise_scaled_mm_cpu: expected ", N, " channel scales, got ", channel_scales.numel(), ".");
+
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  TORCH_CHECK(N % BLOCK_N == 0,
+      "fp8_channelwise_scaled_mm_cpu: N must be a multiple of ", BLOCK_N, ".");
+  TORCH_CHECK(K % TILE_K == 0,
+      "fp8_channelwise_scaled_mm_cpu: K must be a multiple of ", TILE_K, ".");
+
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+  auto out = at::empty({mat1.size(0), N}, mat1.options());
+  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(mat1.size(0));
+  const int num_threads = at::get_num_threads();
+  const int64_t size_per_thread =
+      use_brgemm ? (MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2) : 0;
+  auto buffer = size_per_thread > 0
+      ? at::empty({num_threads, size_per_thread}, mat1.options())
+      : at::empty({0}, mat1.options());
+  const float* bias_data = nullptr;
+  if (bias.has_value()) {
+    TORCH_CHECK(bias.value().numel() == N,
+        "fp8_channelwise_scaled_mm_cpu: bias must have N elements.");
+    TORCH_CHECK(bias.value().scalar_type() == at::kFloat,
+        "fp8_channelwise_scaled_mm_cpu: bias must be float32.");
+    bias_data = bias.value().data_ptr<float>();
+  }
+
+  fp8_scaled_mm_kernel_impl<at::BFloat16>(
+      out.data_ptr<at::BFloat16>(),
+      mat1.data_ptr<at::BFloat16>(),
+      packed_w.data_ptr<at::Float8_e4m3fn>(),
+      channel_scales.data_ptr<float>(),
+      bias_data,
+      buffer.data_ptr<at::BFloat16>(),
+      mat1.size(0),
+      N,
+      K,
+      mat1.stride(0),
+      out.stride(0),
+      N,
+      BLOCK_K,
+      size_per_thread,
+      true);
   return out;
 }

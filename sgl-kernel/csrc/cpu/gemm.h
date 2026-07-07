@@ -80,7 +80,13 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
+enum class CPUQuantMethod : int64_t {
+  BF16 = 0,
+  INT8_W8A8 = 1,
+  FP8_W8A16 = 2,
+  INT4_W4A8 = 3,
+  FP8_W8A16_CHANNEL = 4
+};
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
   return static_cast<int64_t>(a) == b;
@@ -96,6 +102,14 @@ inline int64_t get_4bit_block_k_size(int64_t group_size) {
 
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
+
+at::Tensor fp8_channelwise_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& channel_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
 
 // pack weight to vnni format for int4
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -144,6 +158,7 @@ void fused_experts_fp8_kernel_impl(
     const float* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
+    bool channelwise,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ expert_ids,
