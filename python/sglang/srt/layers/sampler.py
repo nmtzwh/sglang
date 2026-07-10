@@ -29,6 +29,11 @@ if is_cuda():
     )
 if is_npu():
     import torch_npu
+if not is_cuda() and not is_npu():
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +156,35 @@ class Sampler(nn.Module):
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
+                if (
+                    logits.device.type == "cpu"
+                    and not sampling_info.need_min_p_sampling
+                    and not return_logprob
+                    and sampling_info.sampling_seed is None
+                    and logits.is_contiguous()
+                    and sampling_info.temperatures.is_contiguous()
+                    and sampling_info.top_ks.is_contiguous()
+                    and sampling_info.top_ps.is_contiguous()
+                    and hasattr(
+                        torch.ops.sgl_kernel, "sample_top_k_top_p_logits_cpu"
+                    )
+                ):
+                    if simple_sampling_case:
+                        batch_next_token_ids = torch.ops.sgl_kernel.sample_logits_cpu(
+                            logits, sampling_info.temperatures
+                        )
+                    else:
+                        batch_next_token_ids = (
+                            torch.ops.sgl_kernel.sample_top_k_top_p_logits_cpu(
+                                logits,
+                                sampling_info.temperatures,
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                            )
+                        )
+                    self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+                    return batch_next_token_ids
+
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
 

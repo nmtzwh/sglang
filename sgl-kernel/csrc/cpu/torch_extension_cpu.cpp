@@ -59,6 +59,12 @@ std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+at::Tensor sample_logits_cpu(at::Tensor& logits, at::Tensor& temperatures);
+at::Tensor sample_top_k_top_p_logits_cpu(
+    at::Tensor& logits,
+    at::Tensor& temperatures,
+    at::Tensor& top_ks,
+    at::Tensor& top_ps);
 
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -387,6 +393,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_sigmoid_cpu", torch::kCPU, &topk_sigmoid_cpu);
   m.def("topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
+  m.def("sample_logits_cpu(Tensor logits, Tensor temperatures) -> Tensor");
+  m.impl("sample_logits_cpu", torch::kCPU, &sample_logits_cpu);
+  m.def(
+      "sample_top_k_top_p_logits_cpu(Tensor logits, Tensor temperatures, Tensor top_ks, Tensor top_ps) -> Tensor");
+  m.impl(
+      "sample_top_k_top_p_logits_cpu",
+      torch::kCPU,
+      &sample_top_k_top_p_logits_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
       "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "
